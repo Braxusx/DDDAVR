@@ -8,6 +8,8 @@ namespace dxr {
 void Configure(const wchar_t* ini);
 // call on the thread that presents, just before the game's Present (D3D9Ex device)
 void OnPresent(IDirect3DDevice9* dev);
+// build 107: the game is exiting - close the OpenXR session and our D3D11 device while every thread is still alive
+void Shutdown();
 void ConfigureTracking(const wchar_t* ini);
 // camera hook: view (cam+0x90) and projection (cam+0xd0) of the main camera, modified in place; true if changed
 bool ApplyToCamera(float* view, float* proj);

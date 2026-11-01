@@ -5,6 +5,7 @@
 // Frame loop runs inside the game's Present (render thread): xrWaitFrame paces the game to the headset rate.
 #include "xr.h"
 #include "log.h"
+#include "diag.h"
 #include "vkbridge.h"
 #include "dlss_dd.h"
 #include "notice.h"
@@ -62,7 +63,8 @@ void SetMovieFrame(bool m) { if (m != g_movie) Log("xr: movie %s", m ? "playing 
 static double g_nextTry;
 // build 077: shader cache notice + keep-alive frames
 int64_t g_scFmt;
-static CRITICAL_SECTION g_fcs; static volatile LONG g_fcsInit; static volatile double g_lastPresentMs; static int g_keepAlive = 1;
+static CRITICAL_SECTION g_fcs; static volatile LONG g_fcsInit; static volatile LONG g_presentWant; static volatile LONG g_quit;   // build 105: Present waiting for g_fcs
+ static volatile double g_lastPresentMs; static int g_keepAlive = 1;
 static XrCompositionLayerProjection s_pl; static XrCompositionLayerProjectionView s_pv[2]; static XrCompositionLayerQuad s_q[2];
 static const XrCompositionLayerBaseHeader* s_layers[2]; static uint32_t s_n;   // the last frame's layers, re-submitted while the game stalls
 static XrSwapchain g_scN; static std::vector<XrSwapchainImageD3D11KHR> g_imgN; static ID3D11Texture2D* g_nTex[5]; static int g_nShown = -1; static bool g_nBad;
@@ -145,6 +147,7 @@ static bool InitInstance() {
     strcpy(ici.applicationInfo.applicationName, "DDDAVR"); strcpy(ici.applicationInfo.engineName, "MT Framework");
     ici.applicationInfo.applicationVersion = 22; ici.applicationInfo.apiVersion = XR_API_VERSION_1_0;
     ici.enabledExtensionCount = 1; ici.enabledExtensionNames = exts;
+    diag::Scope _ds("xr: xrCreateInstance (OpenXR runtime start)");
     XrResult cr = p_xrCreateInstance(&ici, &g_inst);
     if (XR_FAILED(cr)) {
         std::wstring src; xrprobe::Runtime a = xrprobe::Active32(&src), b = xrprobe::Active64();
@@ -170,7 +173,9 @@ static bool InitInstance() {
     if (!CreateD3D11(req.adapterLuid)) { g_dead = true; return false; }
     XrGraphicsBindingD3D11KHR gb{ XR_TYPE_GRAPHICS_BINDING_D3D11_KHR }; gb.device = g_d11;
     XrSessionCreateInfo sci{ XR_TYPE_SESSION_CREATE_INFO }; sci.next = &gb; sci.systemId = g_sys;
+    diag::Step("xr: xrCreateSession");
     if (!Ok(p_xrCreateSession(g_inst, &sci, &g_sess), "xrCreateSession")) { g_dead = true; return false; }
+    diag::Step("xr: session setup");
     XrReferenceSpaceCreateInfo rs{ XR_TYPE_REFERENCE_SPACE_CREATE_INFO }; rs.poseInReferenceSpace.orientation.w = 1;
     rs.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_LOCAL; if (!Ok(p_xrCreateReferenceSpace(g_sess, &rs, &g_local), "LOCAL space")) { g_dead = true; return false; }
     rs.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_VIEW; if (!Ok(p_xrCreateReferenceSpace(g_sess, &rs, &g_viewSp), "VIEW space")) g_viewSp = XR_NULL_HANDLE;
@@ -545,7 +550,8 @@ bool ApplyToCamera(float* V, float* P) {
         bool persp = (fabsf(fabsf(P[11]) - 1) < 1e-3f || fabsf(fabsf(P[14]) - 1) < 1e-3f) && fabsf(P[15]) < 1e-3f;
         bool title = fabsf(fovV - 21.8f) < 0.6f && fabsf(V[12]) < 1 && fabsf(V[13] + 200) < 1 && fabsf(V[14] + 700) < 1;
         bool f = !persp || title;
-        if (f != g_flatAuto) { Log("xr: %s -> %s", !persp ? "no 3D camera" : title ? "title camera" : "game camera", f ? "flat screen" : "VR"); g_flatAuto = f; }
+        if (f != g_flatAuto) { Log("xr: %s -> %s", !persp ? "no 3D camera" : title ? "title camera" : "game camera", f ? "flat screen" : "VR"); g_flatAuto = f;
+            if (!f) { static bool once; if (!once) { once = true; diag::Rearm("entering VR"); diag::LogModules("entering VR"); } } }
         if (Flat()) return false;
     }
     InterlockedIncrement(&g_camCalls);
@@ -749,8 +755,11 @@ static void SaveLayers(const XrFrameEndInfo& ei) {
 // (world-locked, reprojected by the runtime) and gets the notice
 static bool KeepAliveFrame() {
     bool did = false;
+    // build 105: never take the lock while Present wants it. The critical section is not fair: looping keep-alive
+    // frames (lock held through xrWaitFrame) could starve the game's Present for many seconds - a "freeze" on entering VR.
+    if (g_presentWant || g_quit) return false;
     EnterCriticalSection(&g_fcs);
-    if (g_keepAlive && g_sess && g_running && !g_dead && g_frameOpen && g_lastPresentMs > 0 && Ms() - g_lastPresentMs > 300) {
+    if (!g_presentWant && g_keepAlive && g_sess && g_running && !g_dead && g_frameOpen && g_lastPresentMs > 0 && Ms() - g_lastPresentMs > 300) {
         const XrCompositionLayerBaseHeader* layers[3]; uint32_t n = 0;
         if (g_fs.shouldRender) {
             for (uint32_t k = 0; k < s_n; k++) layers[n++] = s_layers[k];
@@ -776,14 +785,27 @@ static DWORD WINAPI KeepAliveThread(LPVOID) {
     for (;;) { ntc::Poll(); if (!KeepAliveFrame()) Sleep(20); }
 }
 static void OnPresentLocked(IDirect3DDevice9* dev);
+void Shutdown() {
+    if (InterlockedExchange(&g_quit, 1)) return;
+    if (g_fcsInit) EnterCriticalSection(&g_fcs);
+    const bool had = g_inst != XR_NULL_HANDLE;
+    if (had) Teardown();
+    g_dead = true;
+    if (g_fcsInit) LeaveCriticalSection(&g_fcs);
+    Log("exit: %s", had ? "VR session and DLSS helper closed before the game exits" : "no VR session was open");
+}
 void OnPresent(IDirect3DDevice9* dev) {
-    if (!g_enabled || g_dead) return;
+    if (!g_enabled || g_dead || g_quit) return;
     if (InterlockedCompareExchange(&g_fcsInit, 1, 0) == 0) {
         InitializeCriticalSection(&g_fcs);
         CreateThread(nullptr, 0, KeepAliveThread, nullptr, 0, nullptr);
         Log("xr: keep-alive thread started (XrKeepAlive=%d)", g_keepAlive);
     }
+    InterlockedIncrement(&g_presentWant);
+    double w0 = Ms();
     EnterCriticalSection(&g_fcs);
+    InterlockedDecrement(&g_presentWant);
+    { double w = Ms() - w0; if (w > 50) Log("xr: Present waited %.0f ms for the keep-alive frame to finish", w); }
     OnPresentLocked(dev);
     g_lastPresentMs = Ms();
     LeaveCriticalSection(&g_fcs);
@@ -952,13 +974,16 @@ static void OnPresentLocked(IDirect3DDevice9* dev) {
         SaveLayers(ei);   // build 077: for the keep-alive frames
         if (g_fs.shouldRender) if (const XrCompositionLayerBaseHeader* nl = NoticeLayer()) { layers[ei.layerCount++] = nl; ei.layers = layers; }
         vkb::D3D11ReleaseAll();   // build 071: keyed-mutex mode - pictures back to Vulkan
+        diag::Step("present: xrEndFrame");
         Ok(p_xrEndFrame(g_sess, &ei), "xrEndFrame");
         g_frameOpen = false;
     }
     bb->Release();
     XrFrameWaitInfo wi{ XR_TYPE_FRAME_WAIT_INFO }; g_fs = XrFrameState{ XR_TYPE_FRAME_STATE };
+    diag::Step("present: xrWaitFrame");
     if (!Ok(p_xrWaitFrame(g_sess, &wi, &g_fs), "xrWaitFrame")) return;
     t3 = Ms();
+    diag::Step("present: xrBeginFrame");
     XrFrameBeginInfo bi{ XR_TYPE_FRAME_BEGIN_INFO };
     if (!Ok(p_xrBeginFrame(g_sess, &bi), "xrBeginFrame")) return;
     g_frameOpen = true;

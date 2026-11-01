@@ -1,6 +1,6 @@
 // payload_ids.h - resource ids of the files the launcher installs and its art
 #pragma once
-#define DDDAVR_VERSION "0.8.0"
+#define DDDAVR_VERSION "0.8.1"
 #define IDR_D3D9        101
 #define IDR_OPENXR      102
 #define IDR_DLSS_HOST   103

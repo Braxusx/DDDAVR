@@ -36,3 +36,11 @@ void Log(const char* fmt, ...) {
 void LogFlush() {
     if (g_file != INVALID_HANDLE_VALUE) FlushFileBuffers(g_file);
 }
+
+void LogUnlocked(const char* text) {
+    if (g_file == INVALID_HANDLE_VALUE) return;
+    char buf[512]; ULONGLONG t = GetTickCount64() - g_t0;
+    int n = snprintf(buf, sizeof(buf), "[%7llu.%03llu][%5lu] %s\r\n", t / 1000, t % 1000, GetCurrentThreadId(), text);
+    if (n < 0) return; if (n > (int)sizeof(buf)) n = sizeof(buf);
+    DWORD w; WriteFile(g_file, buf, (DWORD)n, &w, nullptr); FlushFileBuffers(g_file);
+}

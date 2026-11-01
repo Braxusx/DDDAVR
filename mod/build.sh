@@ -4,7 +4,7 @@
 set -e
 TC=${TC:?set TC to the llvm-mingw bin folder}
 cd "$(dirname "$0")"
-N=${1:-104}
+N=${1:-107}
 CC=$TC/i686-w64-mingw32-clang; CXX=$TC/i686-w64-mingw32-clang++
 MH=third_party/minhook
 mkdir -p build/obj
@@ -13,7 +13,7 @@ for f in $MH/src/buffer.c $MH/src/hook.c $MH/src/trampoline.c $MH/src/hde/hde32.
 done
 CXXFLAGS="-DDDDAVR_BUILD=\"$N\" -O2 -std=c++17 -fno-threadsafe-statics -Wall -Wno-unused-function -Isrc -Ithird_party/openxr_include -Ithird_party/vulkan -I$MH/include -DUNICODE -D_UNICODE -D__USE_MINGW_ANSI_STDIO=1"
 for f in src/*.cpp; do $CXX $CXXFLAGS -c $f -o build/obj/$(basename $f).o; done
-$CXX -shared -s -o build/d3d9.dll build/obj/*.o src/d3d9.def -static -luser32 -luuid -ld3d11 -ldxgi -lgdi32 -Wl,--kill-at
+$CXX -shared -s -o build/d3d9.dll build/obj/*.o src/d3d9.def -static -luser32 -ladvapi32 -luuid -ld3d11 -ldxgi -lgdi32 -Wl,--kill-at
 ls -la build/d3d9.dll
 # the 64-bit DLSS helper: NGX SDK from https://github.com/NVIDIA/DLSS (NGX=<folder with sdk/include and sdk/lib>, plus
 # NGX/dummy = an empty folder for the MSVC import stubs); MSVC CRT shims for the static NGX lib are in src/dlss_host/msvc_shim.cpp

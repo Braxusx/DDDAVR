@@ -11,6 +11,7 @@
 #include <dxgi1_2.h>
 
 #include "dlss_client.h"
+#include "diag.h"
 #include "dlss_ipc.h"
 
 #include <stdarg.h>
@@ -114,6 +115,7 @@ bool Client::recv(void* p, uint32_t n, uint32_t ms) {
 }
 
 bool Client::start(ID3D11Device* dev, const StartParams& sp, char* why, size_t cap) {
+    diag::Scope _ds("dlss: starting the 64-bit helper");
     stop();
     log_ = sp.log;
     if (!dev || !sp.hostExe || !sp.dataDir) { put(why, cap, "no device or paths"); return false; }
@@ -307,6 +309,7 @@ bool Client::build(int e, uint32_t w, uint32_t h, uint32_t ow, uint32_t oh, DXGI
 }
 
 bool Client::evaluate(ID3D11DeviceContext* ctx, int e, const EyeInputs& in, char* why, size_t cap) {
+    diag::Scope _ds("dlss: evaluate (waiting for the helper)");
     if (!running_) { put(why, cap, "helper not running"); return false; }
     Eye* eye = (e == 0 || e == 1) ? eyes_[e] : nullptr;
     if (!eye || !eye->ready) { put(why, cap, "eye %d not built", e); return false; }

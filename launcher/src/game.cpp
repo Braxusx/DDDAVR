@@ -430,7 +430,7 @@ Report Uninstall(const Game& g, bool deleteIni) {
     if (s.installed || Exists(Join(g.root, kRecord))) { if (!del(L"d3d9.dll")) return r; }
     else if (Exists(Join(g.root, L"d3d9.dll"))) Add(r, '!', "d3d9.dll belongs to another mod and was left in place");
     for (const auto& f : kFiles) if (f.id != IDR_D3D9 && !del(f.rel)) return r;
-    for (const wchar_t* f : { L"ddda_vr_mods\\bbsrpg_core_noglow.arc", L"ddda_vr_mods\\bbsrpg_core_noglow_gog.arc", L"ddda_vr_dlss\\ddda_vr_dlss64.log", L"ddda_vr.log" }) if (!del(f)) return r;
+    for (const wchar_t* f : { L"ddda_vr_mods\\bbsrpg_core_noglow.arc", L"ddda_vr_mods\\bbsrpg_core_noglow_gog.arc", L"ddda_vr_dlss\\ddda_vr_dlss64.log", L"ddda_vr.log", L"ddda_vr_hang.dmp", L"ddda_vr_crash.dmp" }) if (!del(f)) return r;
     RemoveDirectoryW(Join(g.root, L"ddda_vr_dlss").c_str()); RemoveDirectoryW(Join(g.root, L"ddda_vr_mods").c_str());   // only if empty
     Add(r, '+', "Mod files removed");
     if (s.backupPresent) {
@@ -532,7 +532,7 @@ std::wstring CollectLogs(const Game& g, std::string& err) {
     z.Add("system-info.txt", info.data(), info.size());
     auto addFile = [&](const std::wstring& path, const std::string& nm) { std::string d; if (ReadFileAll(path, d)) z.Add(nm, d.data(), d.size()); };
     if (g.valid) {
-        for (const wchar_t* f : { L"ddda_vr.log", L"ddda_vr.ini", L"ddda_vr_install.txt" }) addFile(Join(g.root, f), Narrow(f));
+        for (const wchar_t* f : { L"ddda_vr.log", L"ddda_vr.ini", L"ddda_vr_install.txt", L"ddda_vr_hang.dmp", L"ddda_vr_crash.dmp" }) addFile(Join(g.root, f), Narrow(f));   // 0.8.1: freeze / crash dumps
         addFile(Join(g.root, L"ddda_vr_dlss\\ddda_vr_dlss64.log"), "ddda_vr_dlss64.log");
     }
     addFile(Join(PrefsDir(), L"launcher.log"), "launcher.log");

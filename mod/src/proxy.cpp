@@ -11,6 +11,7 @@
 #include <math.h>
 #include "MinHook.h"
 #include "log.h"
+#include "diag.h"
 #include "xr.h"
 #include "dlss_dd.h"
 #include <d3dcompiler.h>
@@ -399,16 +400,19 @@ static void Screenshot(IDirect3DDevice9* d, IDirect3DSurface9* src = nullptr, co
 }
 static void UiShot(IDirect3DDevice9* d); static void RecFrame(IDirect3DDevice9* d); static void RecStart();
 static HRESULT STDMETHODCALLTYPE hkPresent(IDirect3DDevice9* d, const RECT* a, const RECT* b, HWND w, const RGNDATA* r) {
-    if (!g_presentTid) { g_presentTid = GetCurrentThreadId(); Log("present: first Present on thread %lu (device created on %lu)", g_presentTid, g_devTid); }
+    if (!g_presentTid) { g_presentTid = GetCurrentThreadId(); Log("present: first Present on thread %lu (device created on %lu)", g_presentTid, g_devTid); diag::NameThread("present"); }
+    diag::OnPresent(); diag::Step("present: mod work before the game's Present");
     GpuEnd();
     if (g_capState == 2) { Screenshot(d); UiShot(d); RecStart(); }
     RecFrame(d);
     UiEndFrame(d);
     double tx = NowMs();
-    dxr::OnPresent(d);
+    diag::Step("present: VR frame (copy to the headset)"); dxr::OnPresent(d); diag::Step("present: mod work after the VR frame");
     double t0 = NowMs(); g_s.xrMs += t0 - tx;
     if (g_firstScene > 0) { g_s.submitMs += t0 - g_firstScene; g_firstScene = 0; }
+    diag::Step("present: Direct3D Present (driver)");
     HRESULT hr = oPresent(d, a, b, w, r);
+    diag::Step("main: game code (outside the mod)");
     double t1 = NowMs();
     EndOfFrameStats(t1 - t0);
     GpuBegin(d);
@@ -971,6 +975,8 @@ typedef void(__fastcall* Draw_t)(void* self, void* edx);
 static Draw_t oDraw;
 static void DepthEncode(IDirect3DDevice9* d, int eye);   // build 075
 static void __fastcall hkDraw(void* self, void* edx) {   // BbsRpg 0xdab480: the render thread replays the frame's command list
+    { static bool named; if (!named) { named = true; diag::NameThread("render"); } }
+    diag::Scope _ds("render: the game's command list (draws)");
     if (!dxr::SyncActive()) {   // build 058: time the game's command player in flat / mono too, to compare with the VR replays
         static double ts; static long dn, n; double a = NowMs(); long d = g_fDraws;
         oDraw(self, edx);
@@ -1891,13 +1897,16 @@ static void DepthEncode(IDirect3DDevice9* d, int eye) {
     { static long n; if (dst && (n++ % 900) == 0) { char b[160] = ""; int o = 0; for (int k = 0; k < g_intzN; k++) o += snprintf(b + o, sizeof b - o, " #%d %ld", k, g_intz[k].draws);
         Log("dlss: eye %d draws per INTZ depth this replay:%s -> %d", eye, b, best); } }
     for (int k = 0; k < g_intzN; k++) g_intz[k].draws = 0;
+    diag::Scope _ds("dlss: depth pack - setup");
     if (!dst || best < 0 || !EncInit(d)) return;
     IDirect3DTexture9* depthTex = g_intz[best].tex;
     D3DSURFACE_DESC dd; dst->GetDesc(&dd);
     { D3DSURFACE_DESC zd; g_intz[best].surf->GetDesc(&zd); if (zd.Width != dd.Width || zd.Height != dd.Height) { LOG_FIRST(3, "dlss: depth %ux%u differs from the eye picture %ux%u", zd.Width, zd.Height, dd.Width, dd.Height); return; } }
     IDirect3DSurface9* rt[4] = {}; for (DWORD i = 0; i < 4; i++) if (FAILED(d->GetRenderTarget(i, &rt[i]))) rt[i] = nullptr;
     IDirect3DSurface9* ds = nullptr; if (FAILED(d->GetDepthStencilSurface(&ds))) ds = nullptr;
+    diag::Step("dlss: depth pack - saving device state (state block capture)");
     g_encSB->Capture();
+    diag::Step("dlss: depth pack - setting render target / shader / INTZ texture");
     oSetRT(d, 0, dst); for (DWORD i = 1; i < 4; i++) if (rt[i]) oSetRT(d, i, nullptr);
     oSetDS(d, nullptr);
     oSetVS(d, nullptr); oSetPS(d, g_encPS); d->SetFVF(D3DFVF_XYZRHW | D3DFVF_TEX1);
@@ -1910,9 +1919,12 @@ static void DepthEncode(IDirect3DDevice9* d, int eye) {
     oSetRS(d, D3DRS_CULLMODE, D3DCULL_NONE); oSetRS(d, D3DRS_FILLMODE, D3DFILL_SOLID); oSetRS(d, D3DRS_COLORWRITEENABLE, 0xF);
     const float W = (float)dd.Width - 0.5f, H = (float)dd.Height - 0.5f;
     const float v[4][6] = { { -0.5f, -0.5f, 0, 1, 0, 0 }, { W, -0.5f, 0, 1, 1, 0 }, { -0.5f, H, 0, 1, 0, 1 }, { W, H, 0, 1, 1, 1 } };
-    bool scene = !g_inScene; if (scene) oBegin(d);
+    bool scene = !g_inScene;
+    if (scene) { diag::Step("dlss: depth pack - BeginScene"); oBegin(d); }
+    diag::Step("dlss: depth pack - draw (DrawPrimitiveUP)");
     HRESULT hr = oDPUP(d, D3DPT_TRIANGLESTRIP, 2, v, sizeof v[0]);
-    if (scene) oEnd(d);
+    if (scene) { diag::Step("dlss: depth pack - EndScene"); oEnd(d); }
+    diag::Step("dlss: depth pack - restoring device state");
     LOG_FIRST(2, "dlss: eye %d depth packed -> 0x%08lx%s", eye, (unsigned long)hr, scene ? " (own scene)" : "");
     oSetRT(d, 0, rt[0]); for (DWORD i = 1; i < 4; i++) if (rt[i]) oSetRT(d, i, rt[i]);
     oSetDS(d, ds);
@@ -2060,6 +2072,7 @@ static HRESULT STDMETHODCALLTYPE hkCreateDevice(IDirect3D9* self, UINT ad, D3DDE
     } else hr = oCreateDevice(self, ad, t, w, flags, p, out);
     Log("CreateDevice -> 0x%08lx device %p", (unsigned long)hr, (out && SUCCEEDED(hr)) ? (void*)*out : nullptr);
     if (SUCCEEDED(hr) && out && *out) HookDevice(*out);
+    diag::Rearm("device created");
     DumpExe();
     LogFlush();
     return hr;
@@ -2148,6 +2161,15 @@ static HANDLE WINAPI hkCFA(LPCSTR n, DWORD a, DWORD sh, LPSECURITY_ATTRIBUTES sa
     } else if (n && g_arcOpens < 6 && EndsWithI(n, ".arc")) { g_arcOpens++; Log("file: CreateFileA %s", n); }
     return oCFA(n, a, sh, sa, cd, fl, t);
 }
+// build 107: close VR before the process ends (Virtual Desktop's runtime crashed in its own clean-up otherwise)
+typedef VOID(WINAPI* ExitProcess_t)(UINT); static ExitProcess_t oExitProcess;
+static VOID WINAPI hkExitProcess(UINT code) {
+    Log("exit: the game called ExitProcess(%u)", code);
+    diag::Step("exit: closing VR");
+    dxr::Shutdown();
+    LogFlush();
+    oExitProcess(code);
+}
 static void HookFiles() {
     wchar_t dir[MAX_PATH]; wcscpy(dir, g_ini); wchar_t* sl = wcsrchr(dir, L'\\'); if (sl) sl[1] = 0;
     swprintf(g_glowArcW, MAX_PATH, L"%lsddda_vr_mods\\%ls", dir, g_game ? g_game->noGlowArc : L"bbsrpg_core_noglow.arc");   // build 094: per version
@@ -2157,6 +2179,7 @@ static void HookFiles() {
     HMODULE k = GetModuleHandleW(L"kernel32.dll");
     Hook((void*)GetProcAddress(k, "CreateFileW"), (void*)hkCFW, (void**)&oCFW, "kernel32!CreateFileW");
     Hook((void*)GetProcAddress(k, "CreateFileA"), (void*)hkCFA, (void**)&oCFA, "kernel32!CreateFileA");
+    Hook((void*)GetProcAddress(k, "ExitProcess"), (void*)hkExitProcess, (void**)&oExitProcess, "kernel32!ExitProcess");
 }
 static void HookDesktop() {
     HMODULE u = GetModuleHandleW(L"user32.dll"); if (!u) u = LoadLibraryW(L"user32.dll");
@@ -2234,7 +2257,8 @@ void WINAPI PSGPSampleTexture() { auto f = Real<void(WINAPI*)()>("PSGPSampleText
 void WINAPI Direct3D9EnableMaximizedWindowedModeShim(UINT a) { auto f = Real<void(WINAPI*)(UINT)>("Direct3D9EnableMaximizedWindowedModeShim"); if (f) f(a); }
 }
 
-BOOL WINAPI DllMain(HINSTANCE h, DWORD reason, LPVOID) {
+BOOL WINAPI DllMain(HINSTANCE h, DWORD reason, LPVOID reserved) {
+    if (reason == DLL_PROCESS_DETACH) { diag::OnExit(reserved != nullptr); return TRUE; }   // build 105
     if (reason != DLL_PROCESS_ATTACH) return TRUE;
     DisableThreadLibraryCalls(h);
     wchar_t dir[MAX_PATH]; GetModuleFileNameW(h, dir, MAX_PATH);
@@ -2294,6 +2318,7 @@ BOOL WINAPI DllMain(HINSTANCE h, DWORD reason, LPVOID) {
         Log("dlss: %s - game renders %dx%d per eye, shown at %dx%d", ddlss::QualityName(ddlss::Quality()), g_vrW, g_vrH, ow, oh);
     }
     Log("DDDAVR build " DDDAVR_BUILD " - ForceWidth %d ForceHeight %d ForceWindowed %d NoVsync %d", g_forceW, g_forceH, g_forceWindowed, g_noVsync);
+    diag::Init(h, dir, g_ini);   // build 105: system / GPU / overlay report, crash + hang reports
     // build 057: D3D9Dll=<file in the game folder> loads another d3d9 (e.g. dgVoodoo2's, renamed d3d9_dgvoodoo.dll) instead of the system one
     wchar_t alt[MAX_PATH] = L""; GetPrivateProfileStringW(L"VR", L"D3D9Dll", L"", alt, MAX_PATH, g_ini);
     if (alt[0]) {
