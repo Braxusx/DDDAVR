@@ -16,6 +16,16 @@ Dragon's Dogma: Dark Arisen VR mod with native stereo rendering and DLSS / DXVK 
 Download the release zip and run `DragonsDogmaVR-Launcher_<version>.exe`: pick your game folder, press **Install VR mod**, then **PLAY**.
 Start your OpenXR runtime (Virtual Desktop, SteamVR, Meta Quest Link...) first. See the README in the zip for the manual install.
 
+### Game settings (required)
+
+Before playing in VR, set these in the game's own graphics options (they're easy to miss):
+
+- **V-Sync:** Off
+- **Screen mode:** Windowed
+- **Frame rate:** Variable
+
+Also keep **View Range** at **Farthest** (the launcher's Distance Scaling builds on it).
+
 ## Building
 
 Toolchain: [llvm-mingw](https://github.com/mstorsjo/llvm-mingw) (i686 for the mod and launcher, x86_64 for the DLSS helper).
