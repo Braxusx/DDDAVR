@@ -73,7 +73,7 @@ enum Page { PageMain, PageSettings, PageOptional, PageAbout };
 struct App {
     Page page = PageMain;
     std::vector<Game> games; int gameIdx = -1;
-    Game game; State state; bool running = false;
+    Game game; State state; bool running = false; GameConfig cfg;   // 0.8.1: the game's own settings
     Runtime runtime;
     std::atomic<bool> busy{ false }; std::string busyText; std::mutex mx; bool haveReport = false; Report report; Report pending; bool pendingReady = false;
     bool confirmUninstall = false, deleteIni = false;
@@ -92,9 +92,9 @@ static void Rescan() {
     std::wstring last = GetPref(L"Game", L"Directory", L""); int sel = g_app.games.empty() ? -1 : 0;
     for (int i = 0; i < (int)g_app.games.size(); ++i) if (_wcsicmp(g_app.games[i].root.c_str(), last.c_str()) == 0) sel = i;
     SelectGame(sel);
-    g_app.runtime = ActiveRuntime();
+    g_app.runtime = ActiveRuntime(); g_app.cfg = CheckGameConfig();
 }
-static void Refresh() { if (g_app.game.valid) g_app.state = Check(g_app.game); g_app.running = GameRunning(); g_app.runtime = ActiveRuntime(); }
+static void Refresh() { if (g_app.game.valid) g_app.state = Check(g_app.game); g_app.running = GameRunning(); g_app.runtime = ActiveRuntime(); g_app.cfg = CheckGameConfig(); }
 
 static void StartOp(const char* op, bool deleteIni) {
     if (g_app.busy) return;
@@ -246,6 +246,26 @@ static void ReadyCard() {
         dl->AddText(ImVec2(c.x + 14 * g_s, c.y + (h - ImGui::GetTextLineHeight()) * 0.5f), theme::Muted(), "Requires: a PC VR headset with an OpenXR runtime  \xe2\x80\xa2  DirectX 11 graphics card  \xe2\x80\xa2  NVIDIA RTX for DLSS (optional)");
         ImGui::PopFont();
         ImGui::Dummy(ImVec2(W, h + 8 * g_s));
+    }
+    {   // 0.8.1: the game's own settings the VR mod needs
+        const GameConfig& gc = g_app.cfg;
+        if (gc.found && !gc.issues.empty()) {
+            theme::Dot(theme::Warn()); ImGui::PushFont(theme::g_fonts.bold); ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(theme::Warn()), "Game settings need a change for VR"); ImGui::PopFont();
+            for (const auto& i : gc.issues) theme::Bullet(i.c_str());
+            if (theme::Button("Fix game settings", true, !g_app.running && !g_app.busy)) {
+                std::string err;
+                if (FixGameConfig(err)) { Notice("Game settings fixed: V-Sync off, windowed, variable frame rate. A backup of config.ini was kept.", theme::Good()); g_app.cfg = CheckGameConfig(); }
+                else Notice(err, theme::Bad());
+            }
+            if (g_app.running) { ImGui::SameLine(); theme::Wrapped("Close the game to fix them.", theme::Muted()); }
+            ImGui::Dummy(ImVec2(W, 6 * g_s));
+        } else {
+            ImGui::PushFont(theme::g_fonts.small);
+            if (gc.found) { theme::Dot(theme::Good()); theme::Wrapped("Game settings OK: V-Sync off, windowed, variable frame rate, View Range Farthest.", theme::Muted()); }
+            else { theme::Dot(theme::Muted()); theme::Wrapped("In the game's options set V-Sync Off, Windowed, Frame rate Variable. (The launcher checks them once the game has run.)", theme::Muted()); }
+            ImGui::PopFont();
+            ImGui::Dummy(ImVec2(W, 4 * g_s));
+        }
     }
     float bw = 170 * g_s; ImGui::SetCursorPosX(ImGui::GetCursorPosX() + (W - bw) * 0.5f - 11 * g_s);
     bool can = ok && !g_app.busy && !g_app.running;

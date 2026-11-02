@@ -251,6 +251,45 @@ bool GameRunning() {
     CloseHandle(snap); return r;
 }
 
+static std::string ErrText(DWORD e);
+// ---------------------------------------------------------------- 0.8.1: the game's own config.ini
+static std::wstring GameConfigPath() {
+    wchar_t* p = nullptr; std::wstring d;
+    if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_LocalAppData, 0, nullptr, &p))) d = Join(p, L"CAPCOM\\DRAGONS DOGMA DARK ARISEN\\config.ini");
+    CoTaskMemFree(p);
+    return d;
+}
+static std::wstring CfgGet(const std::wstring& path, const wchar_t* sec, const wchar_t* key) {
+    wchar_t b[128] = L""; GetPrivateProfileStringW(sec, key, L"", b, 128, path.c_str()); return b;
+}
+GameConfig CheckGameConfig() {
+    GameConfig c; std::wstring p = GameConfigPath();
+    if (p.empty() || !Exists(p)) return c;
+    c.found = true;
+    if (_wcsicmp(CfgGet(p, L"DISPLAY", L"VSYNC").c_str(), L"OFF")) c.issues.push_back("V-Sync is on (needs Off)");
+    if (_wcsicmp(CfgGet(p, L"DISPLAY", L"FullScreen").c_str(), L"OFF")) c.issues.push_back("Screen mode is fullscreen (needs Windowed)");
+    std::wstring fps = CfgGet(p, L"GRAPHICS", L"MaxFPS"); double f = fps.empty() ? 0 : _wtof(fps.c_str());
+    if (f > 0 && f < 61) { char t[96]; snprintf(t, sizeof t, "Frame rate is capped at %.0f (needs Variable)", f); c.issues.push_back(t); }
+    std::wstring vr = CfgGet(p, L"GRAPHICS", L"ViewRange");
+    if (!vr.empty() && _wcsicmp(vr.c_str(), L"FARTHEST")) c.issues.push_back("View Range is not Farthest");
+    return c;
+}
+bool FixGameConfig(std::string& err) {
+    if (GameRunning()) { err = "Close the game first; it rewrites its settings when it quits."; return false; }
+    std::wstring p = GameConfigPath();
+    if (p.empty() || !Exists(p)) { err = "The game's config.ini wasn't found. Start the game once without VR, then try again."; return false; }
+    std::wstring bak = p.substr(0, p.size() - 4) + L"_before_vr_mod.ini";
+    if (!Exists(bak) && !CopyFileW(p.c_str(), bak.c_str(), TRUE)) { err = "Couldn't back up config.ini: " + ErrText(GetLastError()); return false; }
+    bool ok = WritePrivateProfileStringW(L"DISPLAY", L"VSYNC", L"OFF", p.c_str()) && WritePrivateProfileStringW(L"DISPLAY", L"FullScreen", L"OFF", p.c_str());
+    std::wstring fps = CfgGet(p, L"GRAPHICS", L"MaxFPS"); double f = fps.empty() ? 0 : _wtof(fps.c_str());
+    if (ok && f > 0 && f < 61) ok = WritePrivateProfileStringW(L"GRAPHICS", L"MaxFPS", L"150.000000", p.c_str());
+    std::wstring vr = CfgGet(p, L"GRAPHICS", L"ViewRange");
+    if (ok && !vr.empty() && _wcsicmp(vr.c_str(), L"FARTHEST")) ok = WritePrivateProfileStringW(L"GRAPHICS", L"ViewRange", L"FARTHEST", p.c_str());
+    if (!ok) { err = "Couldn't write config.ini: " + ErrText(GetLastError()); return false; }
+    Log("game settings fixed in %s (backup %s)", Narrow(p).c_str(), Narrow(bak).c_str());
+    return true;
+}
+
 // ---------------------------------------------------------------- OpenXR runtime
 Runtime ActiveRuntime() {
     Runtime r;

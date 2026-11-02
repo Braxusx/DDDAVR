@@ -26,6 +26,8 @@ Before playing in VR, set these in the game's own graphics options (they're easy
 
 Also keep **View Range** at **Farthest** (the launcher's Distance Scaling builds on it).
 
+The launcher (0.8.1+) checks these in the game's `config.ini` and offers **Fix game settings** (it keeps a backup, `config_before_vr_mod.ini`).
+
 ## Building
 
 Toolchain: [llvm-mingw](https://github.com/mstorsjo/llvm-mingw) (i686 for the mod and launcher, x86_64 for the DLSS helper).

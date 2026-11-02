@@ -65,4 +65,12 @@ extern const char* kModVersion;
 
 std::wstring CollectLogs(const Game& g, std::string& err);
 
+// 0.8.1: the game's own settings the VR mod needs (%LOCALAPPDATA%\CAPCOM\DRAGONS DOGMA DARK ARISEN\config.ini)
+struct GameConfig {
+    bool found = false;               // the game has written its config (it has run at least once)
+    std::vector<std::string> issues;  // what is set wrong, in plain words
+};
+GameConfig CheckGameConfig();
+bool FixGameConfig(std::string& err);   // V-Sync off, windowed, variable frame rate, View Range Farthest (backs up once)
+
 } // namespace ddda
