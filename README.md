@@ -52,5 +52,9 @@ from a game's `nativePC/rom/bbsrpg_core.arc` (the launcher does the same in C++ 
 
 GPL-3.0 (see `LICENSE`). Third-party components: see `THIRD_PARTY_NOTICES.md`.
 
+The DLSS helper program comes with an additional permission to link it with NVIDIA's DLSS SDK (see `LICENSE-NVIDIA-EXCEPTION.md`).
+NVIDIA's `nvngx_dlss.dll` is proprietary NVIDIA software, **not** covered by the GPL; it is redistributed only inside the releases,
+under the NVIDIA RTX SDKs License (copy: `docs/NVIDIA-RTX-SDKs-License.txt`).
+
 Unofficial fan mod, not affiliated with or endorsed by CAPCOM. Dragon's Dogma is a trademark of CAPCOM.
 No game files are included in this repository or in the release.

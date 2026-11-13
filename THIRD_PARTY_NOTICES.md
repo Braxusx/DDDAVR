@@ -13,7 +13,7 @@
 | LZMA SDK decoder (Igor Pavlov) | `launcher/src/lzma` | Public domain |
 | Cinzel typeface (Natanael Gama) | `launcher/art/Cinzel-*.ttf` | SIL Open Font License 1.1 (`launcher/art/Cinzel-OFL.txt`) |
 | Chomsky typeface (Fredrick R. Brennan) | `launcher/art/Chomsky.otf` | SIL Open Font License 1.1 (`launcher/art/Chomsky-OFL.txt`) |
-| NVIDIA DLSS (NGX) runtime `nvngx_dlss.dll` | release / launcher payload, not in this repository | NVIDIA RTX SDKs license (redistributable with the application) |
+| NVIDIA DLSS (NGX) runtime `nvngx_dlss.dll` | release / launcher payload, not in this repository | Proprietary - NVIDIA RTX SDKs License (copy: `docs/NVIDIA-RTX-SDKs-License.txt`); not covered by the GPL |
 
 NVIDIA, the NVIDIA logo and DLSS are trademarks and/or registered trademarks of NVIDIA Corporation in the U.S. and other countries.
 This product uses NVIDIA DLSS technology. The NGX SDK itself (headers and static library) is not included; get it from https://github.com/NVIDIA/DLSS.
