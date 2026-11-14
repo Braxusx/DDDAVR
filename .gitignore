@@ -8,3 +8,5 @@ launcher/payload/*.txt
 *.o
 *.res
 __pycache__/
+!launcher/payload/NOTICES.txt
+!launcher/payload/NVIDIA-RTX-SDKs-License.txt

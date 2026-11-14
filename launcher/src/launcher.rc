@@ -7,6 +7,8 @@ IDR_NGX_DLSS    RCDATA  "nvngx_dlss.dll"
 IDR_INI         RCDATA  "ddda_vr.ini"
 IDR_DXVK        RCDATA  "d3d9_dxvk.dll"
 IDR_DXVK_LIC    RCDATA  "dxvk_license.txt"
+IDR_LIC_NVIDIA  RCDATA  "NVIDIA-RTX-SDKs-License.txt"
+IDR_LIC_NOTICES RCDATA  "NOTICES.txt"
 IDR_ART_BANNER  RCDATA  "banner.jpg"
 IDR_ART_EMBLEM  RCDATA  "emblem.png"
 IDR_FONT_TITLE  RCDATA  "Cinzel-Bold.ttf"
@@ -14,8 +16,8 @@ IDR_FONT_TITLE2 RCDATA  "Cinzel-Regular.ttf"
 IDR_FONT_GOTHIC RCDATA  "Chomsky.otf"
 1 24 "launcher.manifest"
 1 VERSIONINFO
-FILEVERSION 0,8,1,0
-PRODUCTVERSION 0,8,1,0
+FILEVERSION 0,8,5,0
+PRODUCTVERSION 0,8,5,0
 FILEOS 0x40004
 FILETYPE 0x1
 BEGIN
@@ -25,8 +27,8 @@ BEGIN
     BEGIN
       VALUE "FileDescription", "Dragon's Dogma VR Launcher"
       VALUE "ProductName", "Dragon's Dogma VR"
-      VALUE "FileVersion", "0.8.1"
-      VALUE "ProductVersion", "0.8.1"
+      VALUE "FileVersion", "0.8.5"
+      VALUE "ProductVersion", "0.8.5"
       VALUE "CompanyName", "Braxus"
       VALUE "LegalCopyright", "Dragon's Dogma VR Mod by Braxus"
     END

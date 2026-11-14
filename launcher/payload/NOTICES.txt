@@ -1,0 +1,19 @@
+Dragon's Dogma: Dark Arisen VR - notices
+
+Dragon's Dogma VR is free software under the GNU General Public License version 3.
+Source code: https://github.com/Braxusx/DDDAVR
+
+NVIDIA DLSS (nvngx_dlss.dll)
+(C) NVIDIA Corporation. All rights reserved. nvngx_dlss.dll is proprietary software of NVIDIA Corporation.
+It is NOT covered by the GNU General Public License or any other open-source licence of this mod; it is
+redistributed with the mod under the NVIDIA RTX SDKs License Agreement, a copy of which is in
+NVIDIA-RTX-SDKs-License.txt in this folder. This product uses NVIDIA DLSS technology, which needs a
+compatible NVIDIA RTX graphics card. NVIDIA and DLSS are trademarks and/or registered trademarks of NVIDIA
+Corporation in the U.S. and other countries.
+
+ddda_vr_dlss64.exe (the DLSS helper) is part of the mod (GPL v3, with an additional permission to link
+NVIDIA's DLSS SDK - see LICENSE-NVIDIA-EXCEPTION.md in the source repository). It is based on the helper of
+the Dishonored VR mod by Pizza Parker, used with permission.
+
+Other third-party components (DXVK, OpenXR loader, MinHook, Dear ImGui, miniz, LZMA SDK, typefaces):
+see THIRD_PARTY_NOTICES.md in the source repository; DXVK's licence is in ddda_vr_mods\dxvk_license.txt.

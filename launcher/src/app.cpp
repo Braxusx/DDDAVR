@@ -205,6 +205,25 @@ static void SliderRow(const char* label, const char* help, const wchar_t* key, c
     ImGui::SetCursorPosY(std::max(y1, ImGui::GetCursorPosY()) + 6 * g_s);
     ImGui::PopID();
 }
+// 0.8.5: world scale. The mod's WorldScale is game units per metre (100 = the game's own scale); the slider shows the world's
+// size instead (1.00 = normal, 2.00 = everything looks twice as big) and writes 100 / size.
+static void WorldScaleRow() {
+    ImGui::PushID("wscale");
+    float ctrlW = 300 * g_s, x0 = ImGui::GetCursorPosX(), avail = ImGui::GetContentRegionAvail().x, y0 = ImGui::GetCursorPosY();
+    ImGui::BeginDisabled(!Installed());
+    RowLabel("World scale", "How large the world feels. 1.00 is the game's own scale; higher makes everything look bigger, lower smaller.", ctrlW);
+    float y1 = ImGui::GetCursorPosY();
+    ImGui::SetCursorPos(ImVec2(x0 + avail - ctrlW, y0)); ImGui::SetNextItemWidth(ctrlW);
+    ImGuiStorage* stg = ImGui::GetStateStorage(); ImGuiID vid = ImGui::GetID("##val"), aid = ImGui::GetID("##act");
+    float& d = *stg->GetFloatRef(vid, 1.0f); bool& dragging = *stg->GetBoolRef(aid, false);
+    if (!dragging) { float u = (float)_wtof(Get(L"WorldScale", L"100").c_str()); d = u > 1.0f ? 100.0f / u : 1.0f; d = std::round(d * 20.0f) / 20.0f; if (d < 0.5f) d = 0.5f; if (d > 2.0f) d = 2.0f; }
+    ImGui::SliderFloat("##s", &d, 0.5f, 2.0f, "%.2f");
+    dragging = ImGui::IsItemActive();
+    if (ImGui::IsItemDeactivatedAfterEdit()) { d = std::round(d * 20.0f) / 20.0f; if (d < 0.5f) d = 0.5f; if (d > 2.0f) d = 2.0f; wchar_t b[32]; swprintf(b, 32, L"%.2f", 100.0f / d); Set(L"WorldScale", b); }
+    ImGui::EndDisabled();
+    ImGui::SetCursorPosY(std::max(y1, ImGui::GetCursorPosY()) + 6 * g_s);
+    ImGui::PopID();
+}
 static bool ToggleKey(const char* label, const char* help, const wchar_t* key, const wchar_t* def, bool invert = false, bool enabled = true) {
     bool on = (Get(key, def) != L"0") != invert;
     if (theme::Toggle(label, &on, help, enabled && Installed())) { Set(key, (on != invert) ? L"1" : L"0"); return true; }
@@ -416,7 +435,7 @@ static void DistanceCards() {
     ImGui::EndDisabled();
 }
 static void PageSettingsDraw() {
-    theme::Banner("Settings", "PICTURE  \xe2\x80\xa2  DRAW DISTANCE  \xe2\x80\xa2  PERFORMANCE");
+    theme::Banner("Settings", "PICTURE  \xe2\x80\xa2  VIEW  \xe2\x80\xa2  DRAW DISTANCE  \xe2\x80\xa2  PERFORMANCE");
     ImGui::Indent(34 * g_s); ImGui::PushTextWrapPos(ImGui::GetContentRegionMax().x - 34 * g_s);
     NeedInstall();
     bool dlss = Get(L"Dlss", L"1") != L"0";
@@ -434,6 +453,13 @@ static void PageSettingsDraw() {
         ImGui::Dummy(ImVec2(1, 4 * g_s));
     }
     ComboRow("Presets", "The DLSS model. K is the tested default.", L"DlssPreset", L"11", kPreset, 5, Installed() && dlss);
+    theme::EndCard();
+    theme::SectionTitle("View");
+    theme::BeginCard("view");
+    WorldScaleRow();
+    ToggleKey("First person view (Experimental)", "The view sits at your character's head instead of behind them. There to try what it feels like; F2 switches it in game.", L"FirstPerson", L"0");
+    ImGui::Dummy(ImVec2(1, 4 * g_s));
+    ToggleKey("Recentre automatically at start", "Recentres the view during the first seconds after the game starts and when the first 3D view appears, so the logos, the menu and the world are in front of you. F7 recentres at any time.", L"AutoRecenter", L"1");
     theme::EndCard();
     theme::SectionTitle("Distance Scaling");
     theme::Wrapped("How far around you the game keeps trees, rocks, cliffs and other scenery at full detail. Each step loads more of the world, which costs frame rate and memory.", theme::Muted());
@@ -503,11 +529,12 @@ static void PageAboutDraw() {
     theme::EndCard();
     theme::SectionTitle("Credits");
     theme::BeginCard("credits");
-    theme::Bullet("Dragon's Dogma VR by Braxus.");
+    theme::Bullet("Dragon's Dogma VR by Braxus. Free software under the GNU GPL v3; source at github.com/Braxusx/DDDAVR.");
     theme::Bullet("DLSS helper: from the Dishonored VR mod by Pizza Parker (used with permission), based on the BioShock VR DLSS fork (MIT) and DLSS5-Feeder (MIT).");
     theme::Bullet("Launcher: built on the Far Cry 2 VR launcher, whose design follows Pizza Parker's Dishonored VR launcher (with permission).");
     theme::Bullet("DXVK by Philip Rebohle and contributors (zlib licence). miniz by Rich Geldreich (MIT).");
-    theme::Bullet("Dear ImGui by Omar Cornut (MIT). OpenXR loader by the Khronos Group (Apache 2.0). NVIDIA DLSS (NVIDIA RTX SDK licence).");
+    theme::Bullet("Dear ImGui by Omar Cornut (MIT). OpenXR loader by the Khronos Group (Apache 2.0).");
+    theme::Bullet("NVIDIA DLSS \xc2\xa9 NVIDIA Corporation: proprietary, not part of the mod's open-source licence; shipped under the NVIDIA RTX SDKs licence (copy installed in the game's ddda_vr_dlss folder).");
     theme::Bullet("Typefaces: Chomsky by Fredrick R. Brennan and Cinzel by Natanael Gama (both SIL Open Font Licence).");
     ImGui::Dummy(ImVec2(1, 4 * g_s));
     theme::Wrapped("Dragon's Dogma is a trademark of CAPCOM. This is an unofficial fan mod, not affiliated with or endorsed by CAPCOM. Header artwork is AI-generated fan art.", IM_COL32(110, 104, 96, 255));

@@ -11,6 +11,9 @@ void OnPresent(IDirect3DDevice9* dev);
 // build 107: the game is exiting - close the OpenXR session and our D3D11 device while every thread is still alive
 void Shutdown();
 void ConfigureTracking(const wchar_t* ini);
+// build 108 first person: the game camera's look-at target in the world (proxy.cpp finds it each frame)
+void SetFpEye(const float* target, bool valid);
+bool FirstPerson();
 // camera hook: view (cam+0x90) and projection (cam+0xd0) of the main camera, modified in place; true if changed
 bool ApplyToCamera(float* view, float* proj);
 // build 027 UI layer: the transparent shared render target the UI is redirected into (null when not in head-tracking mode)

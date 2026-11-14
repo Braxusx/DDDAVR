@@ -296,6 +296,7 @@ static int g_track = 1, g_headPos = 1, g_lag = 0; static float g_scale = 100.0f;
 static bool g_frameOpen; static XrFrameState g_fs{ XR_TYPE_FRAME_STATE };
 static Q g_refYaw{ 0, 0, 0, 1 }; static float g_refPos[3]; static bool g_refSet, g_wantRef;
 static long g_camCalls, g_camApplied;
+static int g_fp, g_autoRecenter = 1; static float g_fpUp, g_fpFwd = 0.15f, g_fpEye[3]; static volatile bool g_fpEyeValid;   // build 108
 
 void ConfigureTracking(const wchar_t* ini) {
     g_track = GetPrivateProfileIntW(L"VR", L"HeadTracking", 1, ini);
@@ -306,6 +307,38 @@ void ConfigureTracking(const wchar_t* ini) {
     { wchar_t u[32]; GetPrivateProfileStringW(L"VR", L"UiDistance", L"3.0", u, 32, ini); g_uiDist = (float)_wtof(u); if (g_uiDist < 0.5f) g_uiDist = 3.0f; }
     wchar_t b[32]; GetPrivateProfileStringW(L"VR", L"WorldScale", L"100", b, 32, ini); g_scale = (float)_wtof(b); if (g_scale <= 0) g_scale = 100;
     Log("xr: HeadTracking=%d HeadPosition=%d WorldScale %.1f units/m PoseLag %d (F6 toggles tracking / screen, F7 recentres)", g_track, g_headPos, g_scale, g_lag);
+    // build 108: first person (experimental), automatic recentre
+    g_fp = GetPrivateProfileIntW(L"VR", L"FirstPerson", 0, ini);
+    { wchar_t u[32]; GetPrivateProfileStringW(L"VR", L"FpUp", L"0.00", u, 32, ini); g_fpUp = (float)_wtof(u);
+      GetPrivateProfileStringW(L"VR", L"FpForward", L"0.15", u, 32, ini); g_fpFwd = (float)_wtof(u); }
+    g_autoRecenter = GetPrivateProfileIntW(L"VR", L"AutoRecenter", 1, ini);
+    Log("xr: FirstPerson=%d (F2 switches; eye %.2f m up, %.2f m forward of the camera's target) AutoRecenter=%d", g_fp, g_fpUp, g_fpFwd, g_autoRecenter);
+}
+
+// build 108: first person. proxy.cpp finds the game camera's look-at target each frame (SetFpEye); the eye is put there and
+// the view is rebuilt level (the game camera's heading only, world up = +y) before the head pose is applied.
+void SetFpEye(const float* target, bool valid) { if (valid) memcpy(g_fpEye, target, 12); g_fpEyeValid = valid; }
+bool FirstPerson() { return g_fp != 0; }
+static bool FpView(float* V, bool row, float s) {
+    if (!g_fp || !g_fpEyeValid) return false;
+    float m[16]; if (row) memcpy(m, V, 64); else for (int i = 0; i < 4; i++) for (int j = 0; j < 4; j++) m[i * 4 + j] = V[j * 4 + i];
+    // view axes in the world (row-vector view matrix: columns of the 3x3)
+    float r[3] = { m[0], 0, m[8] }, z[3] = { m[2], 0, m[10] };
+    float rl = sqrtf(r[0] * r[0] + r[2] * r[2]), zl = sqrtf(z[0] * z[0] + z[2] * z[2]);
+    if (rl < 0.2f) return false;
+    r[0] /= rl; r[2] /= rl;
+    const float upY = m[5] >= 0 ? 1.0f : -1.0f;
+    if (zl < 0.2f) {   // looking straight up or down: heading from the right axis (z = r x up or up x r, keeping the matrix's handedness)
+        float det = m[0] * (m[5] * m[10] - m[6] * m[9]) - m[1] * (m[4] * m[10] - m[6] * m[8]) + m[2] * (m[4] * m[9] - m[5] * m[8]);
+        float c[3] = { -r[2] * upY, 0, r[0] * upY };   // r x (0, upY, 0)
+        float sg = det >= 0 ? 1.0f : -1.0f; z[0] = c[0] * sg; z[2] = c[2] * sg;
+    } else { z[0] /= zl; z[2] /= zl; }
+    float f[3] = { z[0] * (s > 0 ? 1 : -1), 0, z[2] * (s > 0 ? 1 : -1) };   // level forward
+    float E[3] = { g_fpEye[0] + f[0] * g_fpFwd * g_scale, g_fpEye[1] + upY * g_fpUp * g_scale, g_fpEye[2] + f[2] * g_fpFwd * g_scale };
+    float o[16] = { r[0], 0, z[0], 0,   0, upY, 0, 0,   r[2], 0, z[2], 0,
+                    -(E[0] * r[0] + E[2] * r[2]), -E[1] * upY, -(E[0] * z[0] + E[2] * z[2]), 1 };
+    if (row) memcpy(V, o, 64); else for (int i = 0; i < 4; i++) for (int j = 0; j < 4; j++) V[i * 4 + j] = o[j * 4 + i];
+    return true;
 }
 
 static void PublishPose(XrTime t) {
@@ -562,6 +595,8 @@ bool ApplyToCamera(float* V, float* P) {
     float s = row ? P[11] : P[14];   // w = s * z_view: -1 = right-handed (looks down -z), +1 = left-handed
     LOG_FIRST(1, "xr: game camera matrices are %s-vector, %s-handed; view row0 %.3f %.3f %.3f %.3f row3 %.1f %.1f %.1f %.1f; proj %.3f %.3f | %.3f %.3f %.3f",
               row ? "row" : "column", s < 0 ? "right" : "left", V[0], V[1], V[2], V[3], V[12], V[13], V[14], V[15], P[0], P[5], P[10], P[11], P[14]);
+    {   static bool was; bool on = FpView(V, row, s);   // build 108: first person - the eye at the camera's target, view level
+        if (on != was) { was = on; Log("xr: first person view %s", on ? "on" : g_fp ? "waiting (no camera target found)" : "off"); } }
     // head rotation in the game's view axes (OpenXR: x right, y up, -z forward; left-handed game: flip z)
     Q q = p.rel; if (s > 0) q = { -q.x, -q.y, q.z, q.w };
     float R[3][3] = { { 1 - 2 * (q.y * q.y + q.z * q.z), 2 * (q.x * q.y - q.z * q.w), 2 * (q.x * q.z + q.y * q.w) },
@@ -842,8 +877,19 @@ static void OnPresentLocked(IDirect3DDevice9* dev) {
         static bool insp; bool ins = (GetAsyncKeyState(VK_INSERT) & 0x8000) != 0;   // build 075: DLSS on / off
         if (ins && !insp) ddlss::Toggle();
         insp = ins;
+        static bool f2p; bool f2 = (GetAsyncKeyState(VK_F2) & 0x8000) != 0;   // build 108: first person on / off
+        if (f2 && !f2p) { g_fp = !g_fp; Log("xr: F2 -> first person %s", g_fp ? "on" : "off"); ShowMessage(g_fp ? L"First person: ON (experimental)" : L"First person: OFF", 2.0); }
+        f2p = f2;
         if (!runSince) runSince = now;
-        bool again = !autoDone && now - runSince > 3000; if (again) autoDone = true;
+        // build 108: automatic recentre (AutoRecenter=1): 1, 3 and 6 s after the session starts, and 0.5 s after the game's
+        // 3D camera first takes over from the flat screen - so the logos, the menu and the first view are in front of you
+        bool again = false;
+        if (g_autoRecenter) {
+            static int step; static const double at[3] = { 1000, 3000, 6000 };
+            if (step < 3 && now - runSince > at[step]) { step++; again = true; Log("xr: automatic recentre %d of 3", step); }
+            static double vrSince; static bool vrDone;
+            if (!vrDone && !Flat()) { if (!vrSince) vrSince = now; else if (now - vrSince > 500) { vrDone = true; again = true; Log("xr: automatic recentre (first 3D view)"); } }
+        } else { again = !autoDone && now - runSince > 3000; if (again) autoDone = true; }
         if ((f7 && !f7p) || again) { if (f7 && !f7p) Log("xr: F7 recentre"); g_placed = false; g_wantRef = true; }
         f6p = f6; f7p = f7; }
     double t0 = Ms(), t1 = t0, t2 = t0, t3 = t0;

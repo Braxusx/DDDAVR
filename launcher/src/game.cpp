@@ -319,6 +319,7 @@ struct PayloadFile { int id; const wchar_t* rel; };
 static const PayloadFile kFiles[] = {
     { IDR_D3D9, L"d3d9.dll" }, { IDR_OPENXR, L"openxr_loader.dll" }, { IDR_DXVK, L"d3d9_dxvk.dll" }, { IDR_DXVK_LIC, L"ddda_vr_mods\\dxvk_license.txt" },
     { IDR_DLSS_HOST, L"ddda_vr_dlss\\ddda_vr_dlss64.exe" }, { IDR_NGX_DLSS, L"ddda_vr_dlss\\nvngx_dlss.dll" },
+    { IDR_LIC_NVIDIA, L"ddda_vr_dlss\\NVIDIA-RTX-SDKs-License.txt" }, { IDR_LIC_NOTICES, L"ddda_vr_dlss\\NOTICES.txt" },   // 0.8.5: NVIDIA's licence and the notices travel with nvngx_dlss.dll
 };
 static void Add(Report& r, char kind, const std::string& text) { r.lines.push_back(std::string(1, kind) + " " + text); Log("%c %s", kind, text.c_str()); if (kind == 'x') r.ok = false; }
 static std::string ErrText(DWORD e) {

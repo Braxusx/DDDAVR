@@ -1589,6 +1589,80 @@ static void FullRectTick() {
 
 // build 012: camera setup BbsRpg+0xdc1f80 (thiscall, 1 arg) reads its viewport rect from cam+0x18..0x24 (or, if byte cam+0x13 == 10,
 // from [0x18d0b6c]+0xcb0). F9 forces the rect to the full render size before the camera is set up.
+// build 108: first person (experimental). The view matrix at cam+0x90 is a copy; the game camera object it comes from holds
+// the camera position and its look-at target as two vectors. Neither its place nor its layout is known, so it is found
+// at run time: an object reachable from the camera entry that holds the view's own camera position, with a second vector
+// near it that lies straight ahead of the camera. The target (the point the third-person camera orbits, at the
+// character) becomes the first-person eye point.
+static bool FpVec(const uint8_t* o, int off, float* v) { memcpy(v, o + off, 12); for (int k = 0; k < 3; k++) if (!(v[k] == v[k]) || fabsf(v[k]) > 1e7f) return false; return true; }
+static void FpFindTarget(void* cam, const float* V, const float* P) {
+    bool row = fabsf(fabsf(P[11]) - 1) < 1e-3f && fabsf(P[15]) < 1e-3f, col = fabsf(fabsf(P[14]) - 1) < 1e-3f && fabsf(P[15]) < 1e-3f;
+    if (!row && !col) { dxr::SetFpEye(nullptr, false); return; }
+    float s = row ? P[11] : P[14], m[16];
+    if (row) memcpy(m, V, 64); else for (int i = 0; i < 4; i++) for (int j = 0; j < 4; j++) m[i * 4 + j] = V[j * 4 + i];
+    const float ax[3][3] = { { m[0], m[4], m[8] }, { m[1], m[5], m[9] }, { m[2], m[6], m[10] } };
+    float cp[3], fw[3];
+    for (int k = 0; k < 3; k++) { cp[k] = -(m[12] * ax[0][k] + m[13] * ax[1][k] + m[14] * ax[2][k]); fw[k] = ax[2][k] * (s > 0 ? 1 : -1); }
+    const float tol = 0.5f + 0.0005f * (fabsf(cp[0]) + fabsf(cp[1]) + fabsf(cp[2]));
+    auto near3 = [&](const float* a, const float* b) { return fabsf(a[0] - b[0]) < tol && fabsf(a[1] - b[1]) < tol && fabsf(a[2] - b[2]) < tol; };
+    auto ahead = [&](const float* t, float* dist) { float d[3] = { t[0] - cp[0], t[1] - cp[1], t[2] - cp[2] }; float l = sqrtf(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
+        *dist = l; return l > 10 && l < 5000 && (d[0] * fw[0] + d[1] * fw[1] + d[2] * fw[2]) / l > 0.9995f; };
+    static int ptrOff = -9, posOff, tgtOff; static int miss; static DWORD lastTry, lastLog; static void* lastVt; static int nLog;
+    const uint8_t* c = (const uint8_t*)cam; const DWORD nowT = GetTickCount();
+    if (ptrOff != -9) {
+        const uint8_t* o = ptrOff < 0 ? c : *(const uint8_t* const*)(c + ptrOff);
+        float pv[3], tv[3], dist;
+        if (o && Readable(o, 0x480) && FpVec(o, posOff, pv) && near3(pv, cp) && FpVec(o, tgtOff, tv) && ahead(tv, &dist)) {
+            miss = 0; dxr::SetFpEye(tv, true);
+            void* vt = *(void* const*)o;
+            if (vt != lastVt) { lastVt = vt; Log("fp: camera object %p, class %p", o, vt); }
+            if (nLog < 24 && nowT - lastLog > 10000) { lastLog = nowT; nLog++; Log("fp: camera %.0f %.0f %.0f, target %.0f %.0f %.0f, distance %.0f, target is %.0f above the camera", cp[0], cp[1], cp[2], tv[0], tv[1], tv[2], dist, tv[1] - cp[1]); }
+            return;
+        }
+        if (++miss < 30) return;   // a few frames of mismatch (camera cut): keep the last target
+        dxr::SetFpEye(nullptr, false);
+    }
+    if (nowT - lastTry < 500) return;
+    lastTry = nowT;
+    static int tries;
+    for (int po = -4; po < 0x90; po += 4) {   // -4 = the camera entry itself
+        const uint8_t* o = po < 0 ? c : *(const uint8_t* const*)(c + po);
+        if (!o || ((uintptr_t)o & 3) || !Readable(o, 0x480)) continue;
+        const int lim = po < 0 ? 0x90 : 0x470;
+        for (int a = 0; a + 12 <= lim; a += 4) {
+            float pv[3]; if (!FpVec(o, a, pv) || !near3(pv, cp)) continue;
+            for (int d = 4; d <= 0x80; d += 4) for (int sg = -1; sg <= 1; sg += 2) {
+                int t = a + sg * d; if (t < 0 || t + 12 > lim) continue;
+                float tv[3], dist; if (!FpVec(o, t, tv) || !ahead(tv, &dist)) continue;
+                ptrOff = po; posOff = a; tgtOff = t; miss = 0;
+                Log("fp: camera target found - object %p (camera entry +0x%x, class %p): position at +0x%x, target at +0x%x, distance %.0f units", o, po < 0 ? 0 : po, *(void* const*)o, a, t, dist);
+                {   // one-off notes for development: the floats around the two vectors, and objects this one points to that hold a
+                    // position under the target (the character?)
+                    int lo = (a < t ? a : t) - 0x20; if (lo < 0) lo = 0; int hi = (a > t ? a : t) + 0x30; if (hi > lim) hi = lim;
+                    for (int q = lo; q < hi; q += 16) { float f[4] = { 0 }; memcpy(f, o + q, (hi - q) >= 16 ? 16 : (hi - q)); Log("fp:   +0x%03x  %12.3f %12.3f %12.3f %12.3f", q, f[0], f[1], f[2], f[3]); }
+                    int nc = 0;
+                    for (int q = 0; q + 4 <= lim && nc < 40; q += 4) {
+                        const uint8_t* u = *(const uint8_t* const*)(o + q);
+                        if (!u || ((uintptr_t)u & 3) || u == o || !Readable(u, 0x200)) continue;
+                        for (int w = 0; w + 12 <= 0x200 && nc < 40; w += 4) {
+                            float pp[3]; if (!FpVec(u, w, pp)) continue;
+                            float hx = pp[0] - tv[0], hz = pp[2] - tv[2], dy = tv[1] - pp[1];
+                            if (hx * hx + hz * hz < 100.f * 100.f && dy > 40 && dy < 260 && (fabsf(pp[0]) > 1 || fabsf(pp[2]) > 1)) {
+                                nc++; Log("fp:   object at +0x%x (%p, class %p) has a position at +0x%x: %.0f %.0f %.0f (%.0f under the target, %.0f to the side)", q, u, *(void* const*)u, w, pp[0], pp[1], pp[2], dy, sqrtf(hx * hx + hz * hz));
+                            }
+                        }
+                    }
+                }
+                dxr::SetFpEye(tv, true);
+                return;
+            }
+        }
+    }
+    if (tries++ < 3 || tries % 120 == 0) {
+        Log("fp: camera target not found yet (try %d) - camera at %.0f %.0f %.0f, looking %.2f %.2f %.2f", tries, cp[0], cp[1], cp[2], fw[0], fw[1], fw[2]);
+        if (tries == 1) for (int q = 0; q < 0x90; q += 16) { uint32_t w[4]; float f[4]; memcpy(w, c + q, 16); memcpy(f, c + q, 16); Log("fp:   entry +0x%02x  %08x %08x %08x %08x | %g %g %g %g", q, w[0], w[1], w[2], w[3], f[0], f[1], f[2], f[3]); }
+    }
+}
 typedef char(__fastcall* CamSetup_t)(void* cam, void* edx, void* arg);
 static CamSetup_t oCamSetup;
 static int g_keepVrCam;
@@ -1621,6 +1695,7 @@ static char __fastcall hkCamSetup(void* cam, void* edx, void* arg) {
             if (haveOur && g_keepVrCam >= 1 && !memcmp(P, ourP, 64)) memcpy(P, gameP, 64);
             if (haveOur && g_keepVrCam >= 2 && !memcmp(V, ourV, 64)) memcpy(V, gameV, 64);
             float sv[16], sp[16]; memcpy(sv, V, 64); memcpy(sp, P, 64);
+            FpFindTarget(cam, V, P);   // build 108
             if (dxr::ApplyToCamera(V, P)) {
                 memcpy(ourV, V, 64); memcpy(ourP, P, 64); memcpy(gameV, sv, 64); memcpy(gameP, sp, 64); haveOur = true;
                 char ret = oCamSetup(cam, edx, arg);
@@ -2286,6 +2361,7 @@ BOOL WINAPI DllMain(HINSTANCE h, DWORD reason, LPVOID reserved) {
     g_uiClip = GetPrivateProfileIntW(L"VR", L"UiClipBand", 1, g_ini);
     g_postAll = GetPrivateProfileIntW(L"VR", L"DumpWholeFrame", 0, g_ini);
     dxr::Configure(g_ini); dxr::ConfigureTracking(g_ini);
+    { void TimerFixStartup(const wchar_t*); TimerFixStartup(g_ini); }   // build 108
     g_useEx = GetPrivateProfileIntW(L"VR", L"UseD3D9Ex", 1, g_ini);
     g_forceW = GetPrivateProfileIntW(L"VR", L"ForceWidth", 0, g_ini);
     g_forceH = GetPrivateProfileIntW(L"VR", L"ForceHeight", 0, g_ini);
