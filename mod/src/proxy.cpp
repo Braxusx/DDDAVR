@@ -570,6 +570,35 @@ static float g_plBone[16][12]; static float g_plBoneRoot[3]; static volatile lon
 static float g_fpQj[3]; static volatile bool g_fpQok; static float g_fpLagD[3]; static volatile long g_fpLagN;
 // build 119: the first 16 rows of the bone texture as last written (every skeleton's bones), for the equipment test
 static float g_boneTex[16][1024][4]; static volatile bool g_boneTexOk; static int g_fpHideBack = -1;
+// build 121: the drawn body turns with the view (FpTurnBody, visual only). Before the game unlocks the bone texture, the player's
+// bones and those of the equipment models sitting on the player are turned about the vertical axis through the character's
+// position, by the angle between the skeleton's heading and the head's look direction. Nothing in the game's own objects changes.
+static uint16_t g_slotSeen[16 * 1024];   // per first texel of a skeleton: the camera frame it was last drawn with
+struct EqSlot { int idx; long seq; }; static EqSlot g_eqSlot[16]; static float g_plBone0Raw[12]; static int g_fpTurn = -1;
+static void FpTurnSkeletons(float* tex, int rows) {
+    float lx, lz; if (!dxr::FpLookDir(&lx, &lz)) return;
+    const float fx = tex[2], fz = tex[10], fl = sqrtf(fx * fx + fz * fz); if (!(fl > 20)) return;   // player bone 0, packed +z = forward
+    float dd = atan2f(lx, lz) - atan2f(fx, fz); while (dd > 3.14159265f) dd -= 6.2831853f; while (dd < -3.14159265f) dd += 6.2831853f;
+    if (fabsf(dd) < 0.005f) return;
+    const float c = cosf(dd), sn = sinf(dd), cx = g_fpRoot[0], cz = g_fpRoot[2];
+    struct Done { int idx; float m[12]; }; static Done done[17];
+    const long now = g_camSeq; const int lim = rows * 1024;
+    for (int k = 0; k < 17; k++) {
+        int idx, cap;
+        if (k == 0) { idx = 0; cap = 96; }
+        else { const EqSlot& e = g_eqSlot[k - 1]; if (e.idx <= 0 || now - e.seq > 3) continue; idx = e.idx; cap = 48; }
+        if (idx + 3 > lim) continue;
+        if (done[k].idx == idx && !memcmp(done[k].m, tex + idx * 4, 48)) continue;   // the game has not rewritten it: already turned
+        int n = 1; while (n < cap && idx + (n + 1) * 3 <= lim && (uint16_t)((uint16_t)now - g_slotSeen[idx + n * 3]) >= 4) n++;   // up to the next skeleton
+        if (k == 0) { static int plN = 48; if (n < cap) plN = n; n = plN; if (idx + n * 3 > lim) continue; }   // the player: the count once seen, 48 until then
+        for (int i = 0; i < n; i++) {
+            float* r0 = tex + (idx + i * 3) * 4; float* r2 = r0 + 8;
+            for (int j = 0; j < 3; j++) { const float a = r0[j], b = r2[j]; r0[j] = c * a + sn * b; r2[j] = -sn * a + c * b; }
+            const float tx = r0[3] - cx, tz = r2[3] - cz; r0[3] = c * tx + sn * tz + cx; r2[3] = -sn * tx + c * tz + cz;
+        }
+        done[k].idx = idx; memcpy(done[k].m, tex + idx * 4, 48);
+    }
+}
 static const float kFpEyeUp = 9.0f, kFpEyeFwd = 8.0f;   // eyes from the head joint, game units
 static bool FpHeadFrame(const float* S, float* J, float* U, float* F) {   // S = 3 rows of 4: world = A q + T
     const float cy = sqrtf(S[1] * S[1] + S[5] * S[5] + S[9] * S[9]), cz = sqrtf(S[2] * S[2] + S[6] * S[6] + S[10] * S[10]);
@@ -634,6 +663,9 @@ static void MmUnlock(IDirect3DTexture9* t) {
             DWORD wr; WriteFile(g_boneFile, &h, sizeof h, &wr, nullptr); WriteFile(g_boneFile, m.bits, 4096 * 16, &wr, nullptr); g_boneN++;
         }
         if (g_fpWantBones && m.bits && m.w == 1024 && m.h == 64 && m.bpp == 16 && m.rc.top == 0 && m.rc.left == 0 && m.rc.right >= 48 && m.rc.bottom >= 1) {
+            memcpy(g_plBone0Raw, m.bits, 48);
+            if (g_fpTurn < 0) g_fpTurn = GetPrivateProfileIntW(L"VR", L"FpTurnBody", 1, g_ini);
+            if (g_fpTurn && g_fpQok && m.rc.right >= 1024 && m.pitch == 16384) FpTurnSkeletons((float*)m.bits, m.rc.bottom < 16 ? (int)m.rc.bottom : 16);
             memcpy(g_plBone, m.bits, sizeof g_plBone); memcpy(g_plBoneRoot, g_fpRoot, 12); g_plBoneSeq = g_camSeq;
             if (m.pitch == 16384) { const int rows = m.rc.bottom < 16 ? (int)m.rc.bottom : 16; memcpy(g_boneTex, m.bits, (size_t)rows * 16384); g_boneTexOk = true; }
         }
@@ -676,15 +708,17 @@ static HRESULT FpSetRS(IDirect3DDevice9* d, D3DRENDERSTATETYPE st, DWORD v);
 static float g_fpPlB[2][4];
 static int FpClipPre(IDirect3DDevice9* d) {
     const FpVsInfo* v = FpVs(g_curVS);
-    if (!v || v->samp < 0 || v->shadow || v->skinReg < 0 || v->skinReg >= 64) return 0;
+    if (!v || v->samp < 0 || v->skinReg < 0 || v->skinReg >= 64) return 0;
     const float* sk = g_vsLow[v->skinReg];
     if (sk[0] <= 0.0f) return 0;
+    {   const int tx = (int)(sk[1] * 1024.0f + 0.5f), ty = (int)(sk[2] * 64.0f + 0.5f); if (tx >= 0 && tx < 1024 && ty >= 0 && ty < 16) g_slotSeen[ty * 1024 + tx] = (uint16_t)g_camSeq; }
+    if (v->shadow) return 0;
     if (sk[1] != 0.0f || sk[2] != 0.0f) {
         // build 119: another skeleton. Equipment carried by the player (bow, quiver, shield, sheathed weapons: small models,
         // bone scale under 200 where characters have 240 and more, sitting on the player) is not drawn behind the chest's back
         // plane - so it is hidden while on the back and shows once it is in the hands.
         if (g_fpHideBack < 0) g_fpHideBack = GetPrivateProfileIntW(L"VR", L"FpHideBack", 1, g_ini);
-        if (!g_fpHideBack || !g_fpQok || !g_boneTexOk) return 0;
+        if (!g_fpQok || !g_boneTexOk) return 0;
         const int tx = (int)(sk[1] * 1024.0f + 0.5f), ty = (int)(sk[2] * 64.0f + 0.5f);
         if (tx < 0 || tx > 1021 || ty < 0 || ty > 15) return 0;
         const float* S = g_boneTex[ty][tx];   // bone 0: three texels = three rows
@@ -692,6 +726,9 @@ static int FpClipPre(IDirect3DDevice9* d) {
         if (!(scl > 1.0f && scl < 200.0f)) return 0;
         const float dx = S[3] - g_fpRoot[0], dy = S[7] - g_fpRoot[1], dz = S[11] - g_fpRoot[2];
         if (dx * dx + dz * dz > 150.f * 150.f || dy < -60 || dy > 280) return 0;
+        {   const int idx = ty * 1024 + tx; int slot = -1, old = 0; for (int i = 0; i < 16; i++) { if (g_eqSlot[i].idx == idx) { slot = i; break; } if (g_eqSlot[i].seq < g_eqSlot[old].seq) old = i; }
+            if (slot < 0) { slot = old; g_eqSlot[slot].idx = idx; } g_eqSlot[slot].seq = g_camSeq; }
+        if (!g_fpHideBack) return 0;
         float J[3], U[3], F[3]; if (!FpHeadFrame(g_plBone[15], J, U, F)) return 0;
         const float* C = g_plBone[13]; float cf[3] = { C[2], C[6], C[10] }; const float cl = sqrtf(cf[0] * cf[0] + cf[1] * cf[1] + cf[2] * cf[2]);   // chest forward
         if (cl > 20) { cf[0] /= cl; cf[1] /= cl; cf[2] /= cl; } else memcpy(cf, F, 12);
@@ -1894,7 +1931,7 @@ static void FpFindTarget(void* cam, const float* V, const float* P) {
                     static uint8_t* am; static uint8_t* qm; static const uint8_t* base[NP]; static int nS, done; static float lastPsi = 99, psiAcc; static long seqSeen = -1;
                     auto wrap = [](float a) { while (a > 3.14159265f) a -= 6.2831853f; while (a < -3.14159265f) a += 6.2831853f; return a; };
                     static const float kC[4] = { 0, 1.5707963f, 3.14159265f, -1.5707963f };
-                    const float* S0 = g_plBone[0]; const float bfx = S0[2], bfz = S0[10]; const float bl = sqrtf(bfx * bfx + bfz * bfz);
+                    const float* S0 = g_plBone0Raw; const float bfx = S0[2], bfz = S0[10]; const float bl = sqrtf(bfx * bfx + bfz * bfz);
                     if (study && !done && bl > 20 && g_plBoneSeq >= 0 && g_camSeq - g_plBoneSeq <= 2 && g_plBoneSeq != seqSeen) {
                         const float psiB = atan2f(bfx, bfz);
                         if (fabsf(wrap(psiB - lastPsi)) > 0.12f && Readable(u, 0x1800)) {
@@ -1966,7 +2003,7 @@ static void FpFindTarget(void* cam, const float* V, const float* P) {
                 }
                 endP = endK;
                 if (g_fpMeasureUntil && nowT - lastSample >= 250) {
-                    lastSample = nowT; char b[1000]; int n = snprintf(b, sizeof b, "msr %lu fp %d cam %.1f %.1f %.1f tgt %.1f %.1f %.1f root %.1f %.1f %.1f |", nowT, (int)dxr::FirstPerson(), cp[0], cp[1], cp[2], tv[0], tv[1], tv[2], g_fpRoot[0], g_fpRoot[1], g_fpRoot[2]);
+                    lastSample = nowT; char b[1000]; int n = snprintf(b, sizeof b, "msr %lu zoom %d ok %d fp %d cam %.1f %.1f %.1f tgt %.1f %.1f %.1f root %.1f %.1f %.1f |", nowT, (int)dxr::GameViewZoomed(), (int)g_fpRootOk, (int)dxr::FirstPerson(), cp[0], cp[1], cp[2], tv[0], tv[1], tv[2], g_fpRoot[0], g_fpRoot[1], g_fpRoot[2]);
                     for (int k = 0; k < nCand; k++) {
                         const uint8_t* u = cand[k].ptr < 0 ? o : *(const uint8_t* const*)(o + cand[k].ptr); float pp[3];
                         if (u && !((uintptr_t)u & 3) && Readable(u, 0x800) && FpVec(u, cand[k].off, pp)) n += snprintf(b + n, sizeof b - n, " %d:%.0f,%.0f,%.0f", k, pp[0] - tv[0], pp[1] - tv[1], pp[2] - tv[2]);
