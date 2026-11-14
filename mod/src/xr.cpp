@@ -296,7 +296,7 @@ static int g_track = 1, g_headPos = 1, g_lag = 0; static float g_scale = 100.0f;
 static bool g_frameOpen; static XrFrameState g_fs{ XR_TYPE_FRAME_STATE };
 static Q g_refYaw{ 0, 0, 0, 1 }; static float g_refPos[3]; static bool g_refSet, g_wantRef;
 static long g_camCalls, g_camApplied;
-static int g_fp, g_autoRecenter = 1; static float g_fpUp, g_fpFwd = 0.08f, g_fpHide = 0.22f, g_fpBarPush = 65.0f, g_fpBarLift = 12.0f, g_fpEye[3]; static volatile bool g_fpEyeValid, g_fpActive;   // build 108
+static int g_fp, g_autoRecenter = 1; static float g_fpUp, g_fpFwd = 0.0f, g_fpHide = 0.22f, g_fpBarPush = 65.0f, g_fpBarLift = 12.0f, g_fpEye[3]; static volatile bool g_fpEyeValid, g_fpActive;   // build 108
 
 void ConfigureTracking(const wchar_t* ini) {
     g_track = GetPrivateProfileIntW(L"VR", L"HeadTracking", 1, ini);
@@ -310,7 +310,7 @@ void ConfigureTracking(const wchar_t* ini) {
     // build 108: first person (experimental), automatic recentre
     g_fp = GetPrivateProfileIntW(L"VR", L"FirstPerson", 0, ini);
     { wchar_t u[32]; GetPrivateProfileStringW(L"VR", L"FpUp", L"0.00", u, 32, ini); g_fpUp = (float)_wtof(u);
-      GetPrivateProfileStringW(L"VR", L"FpForward", L"0.08", u, 32, ini); g_fpFwd = (float)_wtof(u);
+      GetPrivateProfileStringW(L"VR", L"FpForward", L"0.00", u, 32, ini); g_fpFwd = (float)_wtof(u);
       GetPrivateProfileStringW(L"VR", L"FpHide", L"0.22", u, 32, ini); g_fpHide = (float)_wtof(u);
       GetPrivateProfileStringW(L"VR", L"FpBarPush", L"65", u, 32, ini); g_fpBarPush = (float)_wtof(u);
       GetPrivateProfileStringW(L"VR", L"FpBarLift", L"12", u, 32, ini); g_fpBarLift = (float)_wtof(u); }
@@ -402,7 +402,7 @@ struct SyncCam { bool valid; float VP[16]; float M[16]; Pose pose;
                  float V[16], VR[16], Vi[16], ViR[16], VPi[16], VPiR[16], camL[3], camR[3];
                  float T[16], Ti[16], Mi[16];
                  double VPu[2][16]; float jx, jy; bool depthInv; long id;
-                 float Mh[16], Pj[16], s, xs0, ys0; bool mh, fp; };   // build 083: head transform (game view -> left eye view), eye projection, game y scale   // build 075: unjittered per-eye VP, jitter (render px), depth convention   // build 052: eye offset forms for relative substitution   // build 043: all eye-dependent forms
+                 float Mh[16], Pj[16], s, xs0, ys0; bool mh, fp; float fpEye[3]; };   // build 083: head transform (game view -> left eye view), eye projection, game y scale   // build 075: unjittered per-eye VP, jitter (render px), depth convention   // build 052: eye offset forms for relative substitution   // build 043: all eye-dependent forms
 static long g_subN[8];   // per kind: 0 VP, 1 VP^-1, 2 V, 3 V^-1, 4 V^-1 transposed 3x4, 5 camera position (VS), 6 PS forms
 static SyncCam g_cams[4]; static long g_camN; static volatile int g_replayEye = -1; static volatile int g_replayCam = -1;
 static long g_subs, g_subFrames, g_camMatch;
@@ -423,7 +423,7 @@ static bool MatInv(const float* m, float* o) {   // general 4x4 inverse (Gauss-J
 static void MatMulD(const double* a, const double* b, double* o) { for (int i = 0; i < 4; i++) for (int j = 0; j < 4; j++) { double x = 0; for (int k = 0; k < 4; k++) x += a[i * 4 + k] * b[k * 4 + j]; o[i * 4 + j] = x; } }
 static void SyncRecord(const Pose& p, const float* V, const float* P, float s, const float* Pu, float jx, float jy, const float* Mh, float xs0, float ys0) {
     SyncCam c{}; c.pose = p; MatMul(V, P, c.VP);
-    if (Mh) { memcpy(c.Mh, Mh, 64); c.mh = true; } c.fp = g_fpActive; memcpy(c.Pj, P, 64); c.s = s; c.xs0 = xs0; c.ys0 = ys0;
+    if (Mh) { memcpy(c.Mh, Mh, 64); c.mh = true; } c.fp = g_fpActive; memcpy(c.fpEye, g_fpEye, 12); memcpy(c.Pj, P, 64); c.s = s; c.xs0 = xs0; c.ys0 = ys0;
     // right-eye offset in the left eye's view axes (OpenXR head axes: x right, y up, +z back; left-handed game: flip z)
     float dw[3] = { p.posR[0] - p.pos[0], p.posR[1] - p.pos[1], p.posR[2] - p.pos[2] }, dh[3]; Rot(Conj(p.abs), dw, dh);
     { float ipd = sqrtf(dw[0] * dw[0] + dw[1] * dw[1] + dw[2] * dw[2]); if (ipd > 0.04f && ipd < 0.09f) g_ipdM = ipd; }
@@ -575,6 +575,20 @@ void WorldGuiLog(const float* c4, long frame, int world) {
     n += snprintf(b + n, sizeof b - n, " | M");
     for (int i = 0; i < 16; i++) n += snprintf(b + n, sizeof b - n, " %.6g", c.Mh[i]);
     Log("%s", b);
+}
+// build 116: for the first-person body cut. A world plane (n . x + d >= 0 kept) as a D3D9 clip plane for the eye being drawn:
+// clip = world x VP, so plane_clip = VP^-1 x plane_world.
+bool WorldPlaneToClip(const float* pw, float* pc) {
+    if (g_replayEye < 0 || g_replayCam < 0) return false;
+    const SyncCam& c = g_cams[g_replayCam]; if (!c.valid) return false;
+    const float* I = g_replayEye == 1 ? c.VPiR : c.VPi;
+    for (int i = 0; i < 4; i++) pc[i] = I[i * 4] * pw[0] + I[i * 4 + 1] * pw[1] + I[i * 4 + 2] * pw[2] + I[i * 4 + 3] * pw[3];
+    return true;
+}
+// the first-person eye point the camera being drawn was built with (world)
+bool ReplayFpEye(float* e) {
+    if (g_replayCam < 0) return false; const SyncCam& c = g_cams[g_replayCam]; if (!c.valid || !c.fp) return false;
+    memcpy(e, c.fpEye, 12); return true;
 }
 bool SyncDebugCam(float* camL, float* camR) { if (g_replayCam < 0) return false; const SyncCam& c = g_cams[g_replayCam]; memcpy(camL, c.camL, 12); memcpy(camR, c.camR, 12); return true; }
 bool SyncPS(float* f, unsigned n) {   // build 043: PS uploads in the right-eye replay (camera position, inverse matrices)

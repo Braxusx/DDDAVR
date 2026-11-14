@@ -565,6 +565,16 @@ static float g_fpRoot[3], g_fpEyeDbg[3]; static volatile bool g_fpRootOk;
 // build 113: the player's neck and head bone matrices (bones 14, 15 of skeleton slot 0,0; joint solved from the 112 recording), copied
 // from the bone texture as the game writes it, with the character position they belong to
 static float g_plBone[16][12]; static float g_plBoneRoot[3]; static volatile long g_plBoneSeq = -1; static volatile bool g_fpWantBones;
+// build 116: the head joint (the point the neck and head bones share, in the mesh's packed coordinates), the head's own axes from
+// the head bone, and the render thread's measurement of how far the drawn head is from the eye the camera was built with
+static float g_fpQj[3]; static volatile bool g_fpQok; static float g_fpLagD[3]; static volatile long g_fpLagN;
+static const float kFpEyeUp = 9.0f, kFpEyeFwd = 8.0f;   // eyes from the head joint, game units
+static bool FpHeadFrame(const float* S, float* J, float* U, float* F) {   // S = 3 rows of 4: world = A q + T
+    const float cy = sqrtf(S[1] * S[1] + S[5] * S[5] + S[9] * S[9]), cz = sqrtf(S[2] * S[2] + S[6] * S[6] + S[10] * S[10]);
+    if (!(cy > 20) || !(cz > 20) || cy > 5000 || cz > 5000) return false;
+    for (int i = 0; i < 3; i++) { J[i] = S[i * 4] * g_fpQj[0] + S[i * 4 + 1] * g_fpQj[1] + S[i * 4 + 2] * g_fpQj[2] + S[i * 4 + 3]; U[i] = S[i * 4 + 1] / cy; F[i] = S[i * 4 + 2] / cz; }
+    return true;
+}
 static const FpVsInfo* FpVs(IDirect3DVertexShader9* vs) {
     for (int i = 0; i < g_fpVsN; i++) if (g_fpVsI[i].vs == vs) return &g_fpVsI[i];
     if (!vs || g_fpVsN >= 256) return nullptr;
@@ -660,15 +670,34 @@ static void FpProbeDraw(IDirect3DDevice9* d, UINT prims, UINT verts) {
 // drawn with a clip plane that removes everything within FpHide of the eye plane: the head goes, the body stays when looking down
 static volatile bool g_fpHideOn; static volatile long g_fpClipped;
 static HRESULT FpSetRS(IDirect3DDevice9* d, D3DRENDERSTATETYPE st, DWORD v);
-static bool FpClipPre(IDirect3DDevice9* d) {
+static float g_fpPlB[2][4];
+static int FpClipPre(IDirect3DDevice9* d) {
     const FpVsInfo* v = FpVs(g_curVS);
-    if (!v || v->samp < 0 || v->shadow || v->skinReg < 0 || v->skinReg >= 64) return false;
+    if (!v || v->samp < 0 || v->shadow || v->skinReg < 0 || v->skinReg >= 64) return 0;
     const float* sk = g_vsLow[v->skinReg];
-    if (sk[1] != 0.0f || sk[2] != 0.0f || sk[0] <= 0.0f) return false;
-    float pl[4]; if (!dxr::FpClipPlane(pl)) return false;
+    if (sk[1] != 0.0f || sk[2] != 0.0f || sk[0] <= 0.0f) return 0;
+    float J[3], U[3], F[3];
+    if (g_fpQok && FpHeadFrame(g_plBone[15], J, U, F)) {
+        static long mSeq = -1; const long bs = g_plBoneSeq;
+        if (g_replay == 0 && bs != mSeq) {   // once per skeleton frame: the drawn head's eye point against the camera's eye point
+            float e[3]; if (dxr::ReplayFpEye(e)) { mSeq = bs; for (int i = 0; i < 3; i++) g_fpLagD[i] = J[i] + U[i] * kFpEyeUp + F[i] * kFpEyeFwd - e[i]; InterlockedIncrement(&g_fpLagN); }
+        }
+        // pass A: everything below the neck. Pass B (FpClipSecond): above the neck only what is well in front of the face (raised hands, weapons)
+        const float Pn[3] = { J[0] - U[0] * 4.0f, J[1] - U[1] * 4.0f, J[2] - U[2] * 4.0f }, Pf[3] = { J[0] + F[0] * 24.0f, J[1] + F[1] * 24.0f, J[2] + F[2] * 24.0f };
+        const float un = U[0] * Pn[0] + U[1] * Pn[1] + U[2] * Pn[2];
+        const float wA[4] = { -U[0], -U[1], -U[2], un }, wB1[4] = { U[0], U[1], U[2], -un }, wB2[4] = { F[0], F[1], F[2], -(F[0] * Pf[0] + F[1] * Pf[1] + F[2] * Pf[2]) };
+        float cA[4];
+        if (dxr::WorldPlaneToClip(wA, cA) && dxr::WorldPlaneToClip(wB1, g_fpPlB[0]) && dxr::WorldPlaneToClip(wB2, g_fpPlB[1])) {
+            d->SetClipPlane(0, cA); FpSetRS(d, D3DRS_CLIPPLANEENABLE, D3DCLIPPLANE0); InterlockedIncrement(&g_fpClipped);
+            return 2;
+        }
+    }
+    float pl[4]; if (!dxr::FpClipPlane(pl)) return 0;
     d->SetClipPlane(0, pl); FpSetRS(d, D3DRS_CLIPPLANEENABLE, D3DCLIPPLANE0); InterlockedIncrement(&g_fpClipped);
-    return true;
+    return 1;
 }
+static void FpClipSecond(IDirect3DDevice9* d) { d->SetClipPlane(0, g_fpPlB[0]); d->SetClipPlane(1, g_fpPlB[1]); FpSetRS(d, D3DRS_CLIPPLANEENABLE, D3DCLIPPLANE0 | D3DCLIPPLANE1); }
+
 static IDirect3DBaseTexture9* g_curTex[8];
 static float g_psc[32][4];
 static DWORD g_rsAlpha, g_rsSrc = 2, g_rsDst = 1, g_rsOp = 1, g_rsCW = 15, g_rsZ = 1, g_rsSrgbW;
@@ -1547,7 +1576,7 @@ template <class F> static void ReticleDraws(IDirect3DDevice9* d, const Tweak& tw
     float pc[2][4] = { { 0, 0, 0, a * 2.5f }, { 1, 1, 1, 0 } }; oPSC(d, 4, pc[0], 2);
 }
 static HRESULT STDMETHODCALLTYPE hkDP(IDirect3DDevice9* d, D3DPRIMITIVETYPE t, UINT a, UINT b) { R1NoteIfEye(); HPScope _hp(HP_DP); g_fDraws++; if (g_diagOn || CAPON) RefreshTexState(d); if (g_diagOn) DiagDraw(); if (g_inBandRT) return D3D_OK; if (g_movieHold > 0 && (RefreshStream(d), MovieBar(t, a, b))) return D3D_OK; OVERLAY_SKIP(); bool ui = UiPreDraw(d); UI_SKIP(); if (ui && (RefreshStream(d), ParkedIcon(t, a, b))) { UiPost(d, ui); return D3D_OK; } if (CAPON) { g_da = { 1, t, a, 0, b, nullptr, 0, 0, b, d }; CapDraw(RA, b); PostRec(RA, b); } Tweak tw; if (UiTweakPre(d, tw) == TW_RETICLE) ReticleDraws(d, tw, [&] { oDP(d, t, a, b); }); HRESULT hr = oDP(d, t, a, b); if (tw.kind) UiTweakPost(d, tw); UiPost(d, ui); return hr; }
-static HRESULT STDMETHODCALLTYPE hkDIP(IDirect3DDevice9* d, D3DPRIMITIVETYPE t, INT a, UINT b, UINT c, UINT e, UINT f) { R1NoteIfEye(); if (g_fpProbe) FpProbeDraw(d, f, c); const bool fpClip = g_fpHideOn && FpClipPre(d); for (int k = 0; k < g_intzN; k++) if (g_curDS == g_intz[k].surf) { g_intz[k].draws++; break; } HPScope _hp(HP_DIP); g_fDraws++; if (g_diagOn || CAPON) RefreshTexState(d); if (g_diagOn) DiagDraw(); if (g_inBandRT) return D3D_OK; OVERLAY_SKIP(); if (PrimPre(d, t, a, b, c, e, f)) return D3D_OK; bool ui = UiPreDraw(d); UI_SKIP(); if (CAPON) { g_da = { 2, t, (UINT)a, b, c, nullptr, 0, e, f, d }; CapDraw(RA, f); PostRec(RA, f); } static unsigned dipN; bool timed = g_prof && (++dipN & 15) == 0; double t0 = timed ? NowMs() : 0; Tweak tw; if (UiTweakPre(d, tw) == TW_RETICLE) ReticleDraws(d, tw, [&] { oDIP(d, t, a, b, c, e, f); }); HRESULT hr = oDIP(d, t, a, b, c, e, f); if (fpClip) oSetRS(d, D3DRS_CLIPPLANEENABLE, 0); if (tw.kind) UiTweakPost(d, tw); if (timed) g_s.drawMs += (NowMs() - t0) * 16.0; UiPost(d, ui); PrimPost(d); return hr; }
+static HRESULT STDMETHODCALLTYPE hkDIP(IDirect3DDevice9* d, D3DPRIMITIVETYPE t, INT a, UINT b, UINT c, UINT e, UINT f) { R1NoteIfEye(); if (g_fpProbe) FpProbeDraw(d, f, c); const int fpClip = g_fpHideOn ? FpClipPre(d) : 0; for (int k = 0; k < g_intzN; k++) if (g_curDS == g_intz[k].surf) { g_intz[k].draws++; break; } HPScope _hp(HP_DIP); g_fDraws++; if (g_diagOn || CAPON) RefreshTexState(d); if (g_diagOn) DiagDraw(); if (g_inBandRT) return D3D_OK; OVERLAY_SKIP(); if (PrimPre(d, t, a, b, c, e, f)) return D3D_OK; bool ui = UiPreDraw(d); UI_SKIP(); if (CAPON) { g_da = { 2, t, (UINT)a, b, c, nullptr, 0, e, f, d }; CapDraw(RA, f); PostRec(RA, f); } static unsigned dipN; bool timed = g_prof && (++dipN & 15) == 0; double t0 = timed ? NowMs() : 0; Tweak tw; if (UiTweakPre(d, tw) == TW_RETICLE) ReticleDraws(d, tw, [&] { oDIP(d, t, a, b, c, e, f); }); HRESULT hr = oDIP(d, t, a, b, c, e, f); if (fpClip == 2) { FpClipSecond(d); oDIP(d, t, a, b, c, e, f); } if (fpClip) oSetRS(d, D3DRS_CLIPPLANEENABLE, 0); if (tw.kind) UiTweakPost(d, tw); if (timed) g_s.drawMs += (NowMs() - t0) * 16.0; UiPost(d, ui); PrimPost(d); return hr; }
 static HRESULT STDMETHODCALLTYPE hkDPUP(IDirect3DDevice9* d, D3DPRIMITIVETYPE t, UINT a, const void* p, UINT s) { R1NoteIfEye(); g_fDraws++; if (g_diagOn || CAPON) RefreshTexState(d); if (g_diagOn) DiagDraw(); g_s.drawsUP++; OVERLAY_SKIP(); bool ui = UiPreDraw(d); UI_SKIP(); if (CAPON) { g_da = { 3, t, 0, 0, a, p, s, 0, a, d }; CapDraw(RA, a); PostRec(RA, a); } HRESULT hr = oDPUP(d, t, a, p, s); UiPost(d, ui); return hr; }
 static HRESULT STDMETHODCALLTYPE hkDIPUP(IDirect3DDevice9* d, D3DPRIMITIVETYPE t, UINT a, UINT b, UINT c, const void* i, D3DFORMAT f, const void* v, UINT s) { R1NoteIfEye();
     g_fDraws++; if (g_diagOn || CAPON) RefreshTexState(d); if (g_diagOn) DiagDraw(); g_s.drawsUP++; OVERLAY_SKIP(); bool ui = UiPreDraw(d); UI_SKIP(); if (CAPON) { g_da = { 4, t, a, b, c, v, s, 0, c, d }; CapDraw(RA, c); PostRec(RA, c); } HRESULT hr = oDIPUP(d, t, a, b, c, i, f, v, s); UiPost(d, ui); return hr;
@@ -1756,35 +1785,60 @@ static void FpFindTarget(void* cam, const float* V, const float* P) {
                     if (ok) {
                         float mv = fabsf(rp[0] - lastRoot[0]) + fabsf(rp[1] - lastRoot[1]) + fabsf(rp[2] - lastRoot[2]);
                         if (h < 60 || nowT - lastT > 2000) h = dy; else if (mv < 0.5f) h += (dy - h) * 0.05f;
+                        const float vstep[3] = { rp[0] - lastRoot[0], rp[1] - lastRoot[1], rp[2] - lastRoot[2] };
                         memcpy(lastRoot, rp, 12); lastT = nowT;
                         float eye[3] = { rp[0], rp[1] + h, rp[2] };
-                        {   // build 113: follow the head bone. While standing, the eye point (above the feet at head height) is tied to
-                            // the head bone; from then on it moves with that bone - lean, bob and crouch included. The bone matrices are
-                            // the previous frame's (the game writes them after the camera), so the character's step since is added.
+                        {   // build 116: the eye sits on the head bone - at the eyes' place, measured from the head joint (where the
+                            // neck and head bones meet; solved while playing, seeded with the value from the 112 recording).
+                            // The bones are the previous frame's, so the character's step since is added; on top of that the
+                            // render thread reports how far the drawn head was from the camera's eye point, and that error
+                            // drives a lead of "lag" frames along the character's motion.
                             static int follow = -1; if (follow < 0) follow = GetPrivateProfileIntW(L"VR", L"FpFollowHead", 1, g_ini);
-                            static float q[3]; static bool bound; static int still, bad; static float boundScale; static DWORD lastB;
-                            still = mv < 0.05f ? still + 1 : 0;
-                            const long bs = g_plBoneSeq; const float* S = g_plBone[15]; bool used = false;
+                            static double Nm[3][3], rv[3]; static int nAcc; static long lastSeq = -1, lastLagN; static float accScale, lag; static int bad; static DWORD lastL;
+                            const long bs = g_plBoneSeq; const float* S14 = g_plBone[14]; const float* S15 = g_plBone[15]; bool used = false;
                             if (follow && bs >= 0 && g_camSeq - bs <= 2) {
-                                const float A[3][3] = { { S[0], S[1], S[2] }, { S[4], S[5], S[6] }, { S[8], S[9], S[10] } }, T[3] = { S[3], S[7], S[11] };
-                                const float det = A[0][0] * (A[1][1] * A[2][2] - A[1][2] * A[2][1]) - A[0][1] * (A[1][0] * A[2][2] - A[1][2] * A[2][0]) + A[0][2] * (A[1][0] * A[2][1] - A[1][1] * A[2][0]);
-                                const float sc = sqrtf(S[0] * S[0] + S[4] * S[4] + S[8] * S[8]);
-                                const bool sane = fabsf(det) > 1e3f && sc > 50 && sc < 2000;
-                                if (sane && (!bound || fabsf(sc - boundScale) > 0.02f * boundScale) && still >= 40) {
-                                    const float b[3] = { g_plBoneRoot[0] - T[0], g_plBoneRoot[1] + h - T[1], g_plBoneRoot[2] - T[2] };
-                                    const float inv[3][3] = {
-                                        { (A[1][1] * A[2][2] - A[1][2] * A[2][1]) / det, (A[0][2] * A[2][1] - A[0][1] * A[2][2]) / det, (A[0][1] * A[1][2] - A[0][2] * A[1][1]) / det },
-                                        { (A[1][2] * A[2][0] - A[1][0] * A[2][2]) / det, (A[0][0] * A[2][2] - A[0][2] * A[2][0]) / det, (A[0][2] * A[1][0] - A[0][0] * A[1][2]) / det },
-                                        { (A[1][0] * A[2][1] - A[1][1] * A[2][0]) / det, (A[0][1] * A[2][0] - A[0][0] * A[2][1]) / det, (A[0][0] * A[1][1] - A[0][1] * A[1][0]) / det } };
-                                    for (int i = 0; i < 3; i++) q[i] = inv[i][0] * b[0] + inv[i][1] * b[1] + inv[i][2] * b[2];
-                                    bound = true; boundScale = sc; bad = 0;
-                                    if (nowT - lastB > 3000) { lastB = nowT; Log("fp: eye tied to the head bone (bone scale %.1f, point %.3f %.3f %.3f, head height %.0f)", sc, q[0], q[1], q[2], h); }
-                                }
-                                if (sane && bound) {
-                                    float e[3]; for (int i = 0; i < 3; i++) e[i] = A[i][0] * q[0] + A[i][1] * q[1] + A[i][2] * q[2] + T[i] + (rp[i] - g_plBoneRoot[i]);
-                                    const float dx = e[0] - rp[0], dy2 = e[1] - (rp[1] + h), dz = e[2] - rp[2];
-                                    if (dx * dx + dz * dz < 90.f * 90.f && dy2 > -140 && dy2 < 60) { memcpy(eye, e, 12); used = true; bad = 0; }
-                                    else if (++bad > 120) { bound = false; Log("fp: head bone point left the body (%.0f %.0f %.0f from the head position) - tied again at the next stop", dx, dy2, dz); }
+                                const float sc = sqrtf(S15[0] * S15[0] + S15[4] * S15[4] + S15[8] * S15[8]);
+                                if (sc > 50 && sc < 2000) {
+                                    if (fabsf(sc - accScale) > 0.02f * sc) { accScale = sc; memset(Nm, 0, sizeof Nm); memset(rv, 0, sizeof rv); nAcc = 0; g_fpQok = false; }
+                                    if (bs != lastSeq) {
+                                        lastSeq = bs;
+                                        for (int i = 0; i < 3; i++) { const double a3[3] = { (double)S14[i * 4] - S15[i * 4], (double)S14[i * 4 + 1] - S15[i * 4 + 1], (double)S14[i * 4 + 2] - S15[i * 4 + 2] }, bb = -((double)S14[i * 4 + 3] - S15[i * 4 + 3]);
+                                            for (int x = 0; x < 3; x++) { rv[x] += a3[x] * bb; for (int y = 0; y < 3; y++) Nm[x][y] += a3[x] * a3[y]; } }
+                                        if (++nAcc % 120 == 0) {
+                                            const double (*m)[3] = Nm; const double det = m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1]) - m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0]) + m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0]);
+                                            const double tr = (m[0][0] + m[1][1] + m[2][2]) / 3.0;
+                                            if (tr > 1e-6 && det > 2e-4 * tr * tr * tr) {   // the three directions are all well measured
+                                                double q[3];
+                                                q[0] = (rv[0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1]) - m[0][1] * (rv[1] * m[2][2] - m[1][2] * rv[2]) + m[0][2] * (rv[1] * m[2][1] - m[1][1] * rv[2])) / det;
+                                                q[1] = (m[0][0] * (rv[1] * m[2][2] - m[1][2] * rv[2]) - rv[0] * (m[1][0] * m[2][2] - m[1][2] * m[2][0]) + m[0][2] * (m[1][0] * rv[2] - rv[1] * m[2][0])) / det;
+                                                q[2] = (m[0][0] * (m[1][1] * rv[2] - rv[1] * m[2][1]) - m[0][1] * (m[1][0] * rv[2] - rv[1] * m[2][0]) + rv[0] * (m[1][0] * m[2][1] - m[1][1] * m[2][0])) / det;
+                                                double res = 0; for (int i = 0; i < 3; i++) { double e1 = ((double)S14[i * 4] - S15[i * 4]) * q[0] + ((double)S14[i * 4 + 1] - S15[i * 4 + 1]) * q[1] + ((double)S14[i * 4 + 2] - S15[i * 4 + 2]) * q[2] + ((double)S14[i * 4 + 3] - S15[i * 4 + 3]); res += e1 * e1; }
+                                                if (res < 2.25 && fabs(q[0]) < 4 && fabs(q[1]) < 4 && fabs(q[2]) < 4) {
+                                                    const bool chg = !g_fpQok || fabs(q[0] - g_fpQj[0]) + fabs(q[1] - g_fpQj[1]) + fabs(q[2] - g_fpQj[2]) > 0.01;
+                                                    g_fpQj[0] = (float)q[0]; g_fpQj[1] = (float)q[1]; g_fpQj[2] = (float)q[2]; g_fpQok = true;
+                                                    if (chg) Log("fp: head joint solved from %d frames: %.3f %.3f %.3f (bone scale %.1f)", nAcc, q[0], q[1], q[2], sc);
+                                                }
+                                            }
+                                        }
+                                    }
+                                    if (!g_fpQok) {   // seed: the joint of the recorded character, if this skeleton agrees with it
+                                        const float sq[3] = { 0.322f, 0.616f, 0.065f }; float res = 0;
+                                        for (int i = 0; i < 3; i++) { float e1 = (S14[i * 4] - S15[i * 4]) * sq[0] + (S14[i * 4 + 1] - S15[i * 4 + 1]) * sq[1] + (S14[i * 4 + 2] - S15[i * 4 + 2]) * sq[2] + (S14[i * 4 + 3] - S15[i * 4 + 3]); res += e1 * e1; }
+                                        if (res < 1.0f) { memcpy(g_fpQj, sq, 12); g_fpQok = true; Log("fp: head joint taken from the reference skeleton (residual %.2f, bone scale %.1f)", sqrtf(res), sc); }
+                                    }
+                                    float J[3], U[3], F[3];
+                                    if (g_fpQok && FpHeadFrame(S15, J, U, F)) {
+                                        float e[3]; for (int i = 0; i < 3; i++) e[i] = J[i] + U[i] * kFpEyeUp + F[i] * kFpEyeFwd + (rp[i] - g_plBoneRoot[i]);
+                                        const float vv = vstep[0] * vstep[0] + vstep[1] * vstep[1] + vstep[2] * vstep[2];
+                                        const long ln = g_fpLagN;
+                                        if (ln != lastLagN) { lastLagN = ln;
+                                            if (vv > 4.0f && vv < 2500.0f) { float c = (g_fpLagD[0] * vstep[0] + g_fpLagD[1] * vstep[1] + g_fpLagD[2] * vstep[2]) / vv; if (c > 2) c = 2; if (c < -2) c = -2; lag += 0.08f * c; if (lag < 0) lag = 0; if (lag > 6) lag = 6; } }
+                                        if (vv < 2500.0f) for (int i = 0; i < 3; i++) e[i] += vstep[i] * lag;
+                                        const float dx = e[0] - rp[0], dy2 = e[1] - (rp[1] + h), dz = e[2] - rp[2];
+                                        if (dx * dx + dz * dz < 120.f * 120.f && dy2 > -150 && dy2 < 70) { memcpy(eye, e, 12); used = true; bad = 0; }
+                                        else if (++bad == 120) Log("fp: head point left the body (%.0f %.0f %.0f from the head position)", dx, dy2, dz);
+                                        if (nowT - lastL > 10000) { lastL = nowT; Log("fp: view lead %.2f frames (last measured head-to-eye error %.1f %.1f %.1f, step %.1f)", lag, g_fpLagD[0], g_fpLagD[1], g_fpLagD[2], sqrtf(vv)); }
+                                    }
                                 }
                             }
                             static int wasUsed = -1; if ((int)used != wasUsed) { wasUsed = used; Log("fp: eye %s", used ? "follows the head bone" : "at the character position (head bone not in use)"); }
