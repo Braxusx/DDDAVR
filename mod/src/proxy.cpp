@@ -1769,6 +1769,7 @@ static void FpFindTarget(void* cam, const float* V, const float* P) {
         *dist = l; return l > 10 && l < 5000 && (d[0] * fw[0] + d[1] * fw[1] + d[2] * fw[2]) / l > 0.9995f; };
     static int ptrOff = -9, posOff, tgtOff; static int miss; static DWORD lastTry, lastLog; static void* lastVt; static int nLog;
     const uint8_t* c = (const uint8_t*)cam; const DWORD nowT = GetTickCount();
+    if (!g_mmCsInit) { InitializeCriticalSection(&g_mmCs); g_mmCsInit = true; }   // build 117: was only set up by the End measurement, so the bones were never read without it
     if (ptrOff != -9) {
         const uint8_t* o = ptrOff < 0 ? c : *(const uint8_t* const*)(c + ptrOff);
         float pv[3], tv[3], dist;
