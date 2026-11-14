@@ -296,7 +296,7 @@ static int g_track = 1, g_headPos = 1, g_lag = 0; static float g_scale = 100.0f;
 static bool g_frameOpen; static XrFrameState g_fs{ XR_TYPE_FRAME_STATE };
 static Q g_refYaw{ 0, 0, 0, 1 }; static float g_refPos[3]; static bool g_refSet, g_wantRef;
 static long g_camCalls, g_camApplied;
-static int g_fp, g_autoRecenter = 1; static float g_fpUp, g_fpFwd = 0.15f, g_fpEye[3]; static volatile bool g_fpEyeValid;   // build 108
+static int g_fp, g_autoRecenter = 1; static float g_fpUp, g_fpFwd = 0.27f, g_fpEye[3]; static volatile bool g_fpEyeValid;   // build 108
 
 void ConfigureTracking(const wchar_t* ini) {
     g_track = GetPrivateProfileIntW(L"VR", L"HeadTracking", 1, ini);
@@ -310,7 +310,7 @@ void ConfigureTracking(const wchar_t* ini) {
     // build 108: first person (experimental), automatic recentre
     g_fp = GetPrivateProfileIntW(L"VR", L"FirstPerson", 0, ini);
     { wchar_t u[32]; GetPrivateProfileStringW(L"VR", L"FpUp", L"0.00", u, 32, ini); g_fpUp = (float)_wtof(u);
-      GetPrivateProfileStringW(L"VR", L"FpForward", L"0.15", u, 32, ini); g_fpFwd = (float)_wtof(u); }
+      GetPrivateProfileStringW(L"VR", L"FpForward", L"0.27", u, 32, ini); g_fpFwd = (float)_wtof(u); }
     g_autoRecenter = GetPrivateProfileIntW(L"VR", L"AutoRecenter", 1, ini);
     Log("xr: FirstPerson=%d (F2 switches; eye %.2f m up, %.2f m forward of the camera's target) AutoRecenter=%d", g_fp, g_fpUp, g_fpFwd, g_autoRecenter);
 }
@@ -595,7 +595,9 @@ bool ApplyToCamera(float* V, float* P) {
     float s = row ? P[11] : P[14];   // w = s * z_view: -1 = right-handed (looks down -z), +1 = left-handed
     LOG_FIRST(1, "xr: game camera matrices are %s-vector, %s-handed; view row0 %.3f %.3f %.3f %.3f row3 %.1f %.1f %.1f %.1f; proj %.3f %.3f | %.3f %.3f %.3f",
               row ? "row" : "column", s < 0 ? "right" : "left", V[0], V[1], V[2], V[3], V[12], V[13], V[14], V[15], P[0], P[5], P[10], P[11], P[14]);
-    {   static bool was; bool on = FpView(V, row, s);   // build 108: first person - the eye at the camera's target, view level
+    float gameV[16]; memcpy(gameV, V, 64);   // build 109: the game's own view, for the world markers in first person
+    bool fpOn = false;
+    {   static bool was; bool on = FpView(V, row, s); fpOn = on;   // build 108: first person - the eye at the camera's target, view level
         if (on != was) { was = on; Log("xr: first person view %s", on ? "on" : g_fp ? "waiting (no camera target found)" : "off"); } }
     // head rotation in the game's view axes (OpenXR: x right, y up, -z forward; left-handed game: flip z)
     Q q = p.rel; if (s > 0) q = { -q.x, -q.y, q.z, q.w };
@@ -645,7 +647,11 @@ bool ApplyToCamera(float* V, float* P) {
     }
     memcpy(g_modP, P, 64); g_projValid = true;
     if (p.eye >= 0) { memcpy(g_eyeP[p.eye], P, 64); g_eyePValid[p.eye] = true; }
-    if (p.sync && row) SyncRecord(p, V, P, s, Pu, jx, jy, M, g_origP[0], g_origP[5]);
+    // build 109: the world markers turn the game's own screen positions into eye positions through "game view -> eye view".
+    // In first person that is no longer just the head transform M: it is (game view)^-1 x (our final view).
+    float Mt[16]; const float* Mh = M;
+    if (fpOn && row) { float gi[16]; if (MatInv(gameV, gi)) { MatMul(gi, V, Mt); Mh = Mt; } }
+    if (p.sync && row) SyncRecord(p, V, P, s, Pu, jx, jy, Mh, g_origP[0], g_origP[5]);
     LOG_FIRST(1, "xr: game frustum tangents L %.3f R %.3f D %.3f U %.3f (%.0f x %.0f deg)", p.gt[0], p.gt[1], p.gt[2], p.gt[3],
               (atanf(p.gt[1]) - atanf(p.gt[0])) * 57.2958f, (atanf(p.gt[3]) - atanf(p.gt[2])) * 57.2958f);
     EnterCriticalSection(&g_pcs); g_used[g_nUsed & 3] = p; g_nUsed++; LeaveCriticalSection(&g_pcs);

@@ -544,6 +544,83 @@ static HRESULT STDMETHODCALLTYPE hkSetRT(IDirect3DDevice9* d, DWORD i, IDirect3D
 // and during a capture frame records them for every draw in a ring; the last 512 draws are dumped at Present,
 // with the bytecode of their pixel shaders, to ddda_post_N.txt / ddda_ps_<ptr>.bin.
 static IDirect3DPixelShader9* g_curPS; static IDirect3DVertexShader9* g_curVS;
+// build 109: first-person probe (development). One frame's draws of the left-eye replay: every large vertex-shader constant
+// upload is tested as a set of bone matrices (three layouts, world and camera-relative), with how many of them lie near the
+// camera's target (the character's head), and the constant names of the vertex shaders involved. Tells how the game uploads
+// skeletons, so the head's meshes can be recognised and left out in first person.
+static volatile int g_fpProbe;   // 1 = armed (game thread), 2 = recording (render thread)
+static float g_fpTarget[3], g_fpCam[3]; static volatile bool g_fpHave;
+struct FpUp { UINT r, n; float f[256 * 4]; };
+static FpUp g_fpUp[3]; static int g_fpUpN; static int g_fpDraws, g_fpLogged; static void* g_fpVs[48]; static int g_fpVsN;
+static void FpProbeUpload(UINT r, const float* f, UINT n) {
+    if (g_fpProbe != 2 || g_fpUpN >= 3 || n > 256) return;
+    FpUp& u = g_fpUp[g_fpUpN++]; u.r = r; u.n = n; memcpy(u.f, f, n * 16);
+}
+static void FpProbeShader(IDirect3DVertexShader9* vs) {
+    for (int i = 0; i < g_fpVsN; i++) if (g_fpVs[i] == vs) return;
+    if (!vs || g_fpVsN >= 48) return;
+    g_fpVs[g_fpVsN++] = vs;
+    UINT sz = 0; if (FAILED(vs->GetFunction(nullptr, &sz)) || sz < 32 || sz > 262144) return;
+    std::vector<DWORD> fn(sz / 4 + 1); if (FAILED(vs->GetFunction(fn.data(), &sz))) return;
+    const size_t nt = sz / 4; char line[900]; int ln = 0; line[0] = 0;
+    for (size_t i = 1; i + 2 < nt; ) {
+        DWORD t = fn[i];
+        if ((t & 0xFFFF) != 0xFFFE) break;   // comments come first
+        size_t len = (t >> 16) & 0x7FFF;
+        if (len >= 8 && fn[i + 1] == 0x42415443) {   // 'CTAB'
+            const uint8_t* b = (const uint8_t*)&fn[i + 2]; const size_t bl = (len - 1) * 4;
+            DWORD cnt, off; memcpy(&cnt, b + 12, 4); memcpy(&off, b + 16, 4);
+            for (DWORD k = 0; k < cnt && off + (k + 1) * 20 <= bl; k++) {
+                const uint8_t* e = b + off + k * 20; DWORD nameOff; WORD rset, ridx, rcnt; memcpy(&nameOff, e, 4); memcpy(&rset, e + 4, 2); memcpy(&ridx, e + 6, 2); memcpy(&rcnt, e + 8, 2);
+                if (nameOff >= bl) continue;
+                const char* nm = (const char*)b + nameOff; if (strnlen(nm, bl - nameOff) >= bl - nameOff) continue;
+                if (rset != 2 && rset != 3) continue;   // float registers and samplers
+                ln += snprintf(line + ln, sizeof line - ln, " %s %c%u", nm, rset == 2 ? 'c' : 's', ridx); if (rcnt > 1) ln += snprintf(line + ln, sizeof line - ln, "x%u", rcnt);
+                if (ln > 820) { Log("probe: vs %p:%s", vs, line); ln = 0; line[0] = 0; }
+            }
+            break;
+        }
+        i += len + 1;
+    }
+    if (ln) Log("probe: vs %p:%s", vs, line);
+}
+static void FpProbeDraw(IDirect3DDevice9* d, UINT prims, UINT verts) {
+    if (g_fpProbe == 1 && g_replay == 0) { g_fpProbe = 2; g_fpDraws = g_fpLogged = g_fpUpN = 0; g_fpVsN = 0;
+        Log("probe: recording one left-eye frame - camera %.0f %.0f %.0f, target %.0f %.0f %.0f", g_fpCam[0], g_fpCam[1], g_fpCam[2], g_fpTarget[0], g_fpTarget[1], g_fpTarget[2]); return; }
+    if (g_fpProbe != 2) return;
+    if (g_replay != 0 || ++g_fpDraws > 6000) { Log("probe: done - %d draws seen, %d with large uploads logged, %d vertex shaders", g_fpDraws, g_fpLogged, g_fpVsN); g_fpProbe = 0; return; }
+    for (int ui = 0; ui < g_fpUpN && g_fpLogged < 700; ui++) {
+        const FpUp& u = g_fpUp[ui];
+        char b[700]; int n = snprintf(b, sizeof b, "probe: draw %d prims %u verts %u vs %p: c%u x%u", g_fpDraws, prims, verts, g_curVS, u.r, u.n);
+        // layouts: A = 3 registers per bone, translation in .w; B = 4 registers, translation in the 4th; C = 4 registers, translation in .w
+        for (int h = 0; h < 3; h++) {
+            const int per = h == 0 ? 3 : 4; const int nb = (int)u.n / per; if (nb < 1) continue;
+            int ortho = 0, n60[2] = { 0, 0 }, n300[2] = { 0, 0 }; float mind[2] = { 1e9f, 1e9f }, maxd[2] = { 0, 0 };
+            for (int k = 0; k < nb; k++) {
+                const float* m = u.f + k * per * 4; float t[3];
+                if (h == 1) { t[0] = m[12]; t[1] = m[13]; t[2] = m[14]; } else { t[0] = m[3]; t[1] = m[7]; t[2] = m[11]; }
+                float l0 = m[0] * m[0] + m[1] * m[1] + m[2] * m[2], l1 = m[4] * m[4] + m[5] * m[5] + m[6] * m[6];
+                if (l0 > 0.8f && l0 < 1.25f && l1 > 0.8f && l1 < 1.25f) ortho++;
+                for (int sp = 0; sp < 2; sp++) {
+                    float w[3] = { t[0] + (sp ? g_fpCam[0] : 0), t[1] + (sp ? g_fpCam[1] : 0), t[2] + (sp ? g_fpCam[2] : 0) };
+                    float dx = w[0] - g_fpTarget[0], dy = w[1] - g_fpTarget[1], dz = w[2] - g_fpTarget[2], dd = sqrtf(dx * dx + dy * dy + dz * dz);
+                    if (!(dd == dd)) dd = 1e9f;
+                    if (dd < 60) n60[sp]++; if (dd < 300) n300[sp]++; if (dd < mind[sp]) mind[sp] = dd; if (dd > maxd[sp] && dd < 1e8f) maxd[sp] = dd;
+                }
+            }
+            n += snprintf(b + n, sizeof b - n, " | %c %d bones, unit %d, world <60:%d <300:%d (%.0f..%.0f), camrel <60:%d <300:%d (%.0f..%.0f)", "ABC"[h], nb, ortho,
+                          n60[0], n300[0], mind[0], maxd[0], n60[1], n300[1], mind[1], maxd[1]);
+        }
+        Log("%s", b); g_fpLogged++;
+        if (g_fpLogged <= 60 || (g_fpLogged % 25) == 0) {   // raw start of the upload for a sample of them
+            const float* f = u.f; const UINT rows = u.n < 8 ? u.n : 8; char r[600]; int rn = 0;
+            for (UINT k = 0; k < rows; k++) rn += snprintf(r + rn, sizeof r - rn, " [%.3f %.3f %.3f %.3f]", f[k * 4], f[k * 4 + 1], f[k * 4 + 2], f[k * 4 + 3]);
+            Log("probe:   raw%s", r);
+        }
+        FpProbeShader(g_curVS);
+    }
+    g_fpUpN = 0;
+}
 static IDirect3DBaseTexture9* g_curTex[8];
 static float g_psc[32][4];
 static DWORD g_rsAlpha, g_rsSrc = 2, g_rsDst = 1, g_rsOp = 1, g_rsCW = 15, g_rsZ = 1, g_rsSrgbW;
@@ -1417,7 +1494,7 @@ template <class F> static void ReticleDraws(IDirect3DDevice9* d, const Tweak& tw
     float pc[2][4] = { { 0, 0, 0, a * 2.5f }, { 1, 1, 1, 0 } }; oPSC(d, 4, pc[0], 2);
 }
 static HRESULT STDMETHODCALLTYPE hkDP(IDirect3DDevice9* d, D3DPRIMITIVETYPE t, UINT a, UINT b) { R1NoteIfEye(); HPScope _hp(HP_DP); g_fDraws++; if (g_diagOn || CAPON) RefreshTexState(d); if (g_diagOn) DiagDraw(); if (g_inBandRT) return D3D_OK; if (g_movieHold > 0 && (RefreshStream(d), MovieBar(t, a, b))) return D3D_OK; OVERLAY_SKIP(); bool ui = UiPreDraw(d); UI_SKIP(); if (ui && (RefreshStream(d), ParkedIcon(t, a, b))) { UiPost(d, ui); return D3D_OK; } if (CAPON) { g_da = { 1, t, a, 0, b, nullptr, 0, 0, b, d }; CapDraw(RA, b); PostRec(RA, b); } Tweak tw; if (UiTweakPre(d, tw) == TW_RETICLE) ReticleDraws(d, tw, [&] { oDP(d, t, a, b); }); HRESULT hr = oDP(d, t, a, b); if (tw.kind) UiTweakPost(d, tw); UiPost(d, ui); return hr; }
-static HRESULT STDMETHODCALLTYPE hkDIP(IDirect3DDevice9* d, D3DPRIMITIVETYPE t, INT a, UINT b, UINT c, UINT e, UINT f) { R1NoteIfEye(); for (int k = 0; k < g_intzN; k++) if (g_curDS == g_intz[k].surf) { g_intz[k].draws++; break; } HPScope _hp(HP_DIP); g_fDraws++; if (g_diagOn || CAPON) RefreshTexState(d); if (g_diagOn) DiagDraw(); if (g_inBandRT) return D3D_OK; OVERLAY_SKIP(); if (PrimPre(d, t, a, b, c, e, f)) return D3D_OK; bool ui = UiPreDraw(d); UI_SKIP(); if (CAPON) { g_da = { 2, t, (UINT)a, b, c, nullptr, 0, e, f, d }; CapDraw(RA, f); PostRec(RA, f); } static unsigned dipN; bool timed = g_prof && (++dipN & 15) == 0; double t0 = timed ? NowMs() : 0; Tweak tw; if (UiTweakPre(d, tw) == TW_RETICLE) ReticleDraws(d, tw, [&] { oDIP(d, t, a, b, c, e, f); }); HRESULT hr = oDIP(d, t, a, b, c, e, f); if (tw.kind) UiTweakPost(d, tw); if (timed) g_s.drawMs += (NowMs() - t0) * 16.0; UiPost(d, ui); PrimPost(d); return hr; }
+static HRESULT STDMETHODCALLTYPE hkDIP(IDirect3DDevice9* d, D3DPRIMITIVETYPE t, INT a, UINT b, UINT c, UINT e, UINT f) { R1NoteIfEye(); if (g_fpProbe) FpProbeDraw(d, f, c); for (int k = 0; k < g_intzN; k++) if (g_curDS == g_intz[k].surf) { g_intz[k].draws++; break; } HPScope _hp(HP_DIP); g_fDraws++; if (g_diagOn || CAPON) RefreshTexState(d); if (g_diagOn) DiagDraw(); if (g_inBandRT) return D3D_OK; OVERLAY_SKIP(); if (PrimPre(d, t, a, b, c, e, f)) return D3D_OK; bool ui = UiPreDraw(d); UI_SKIP(); if (CAPON) { g_da = { 2, t, (UINT)a, b, c, nullptr, 0, e, f, d }; CapDraw(RA, f); PostRec(RA, f); } static unsigned dipN; bool timed = g_prof && (++dipN & 15) == 0; double t0 = timed ? NowMs() : 0; Tweak tw; if (UiTweakPre(d, tw) == TW_RETICLE) ReticleDraws(d, tw, [&] { oDIP(d, t, a, b, c, e, f); }); HRESULT hr = oDIP(d, t, a, b, c, e, f); if (tw.kind) UiTweakPost(d, tw); if (timed) g_s.drawMs += (NowMs() - t0) * 16.0; UiPost(d, ui); PrimPost(d); return hr; }
 static HRESULT STDMETHODCALLTYPE hkDPUP(IDirect3DDevice9* d, D3DPRIMITIVETYPE t, UINT a, const void* p, UINT s) { R1NoteIfEye(); g_fDraws++; if (g_diagOn || CAPON) RefreshTexState(d); if (g_diagOn) DiagDraw(); g_s.drawsUP++; OVERLAY_SKIP(); bool ui = UiPreDraw(d); UI_SKIP(); if (CAPON) { g_da = { 3, t, 0, 0, a, p, s, 0, a, d }; CapDraw(RA, a); PostRec(RA, a); } HRESULT hr = oDPUP(d, t, a, p, s); UiPost(d, ui); return hr; }
 static HRESULT STDMETHODCALLTYPE hkDIPUP(IDirect3DDevice9* d, D3DPRIMITIVETYPE t, UINT a, UINT b, UINT c, const void* i, D3DFORMAT f, const void* v, UINT s) { R1NoteIfEye();
     g_fDraws++; if (g_diagOn || CAPON) RefreshTexState(d); if (g_diagOn) DiagDraw(); g_s.drawsUP++; OVERLAY_SKIP(); bool ui = UiPreDraw(d); UI_SKIP(); if (CAPON) { g_da = { 4, t, a, b, c, v, s, 0, c, d }; CapDraw(RA, c); PostRec(RA, c); } HRESULT hr = oDIPUP(d, t, a, b, c, i, f, v, s); UiPost(d, ui); return hr;
@@ -1450,6 +1527,7 @@ static long g_capVsc;
 static HRESULT STDMETHODCALLTYPE hkVSC(IDirect3DDevice9* d, UINT r, const float* f, UINT n) { HPScope _hp(HP_VSC);
     g_fVsc++;
     if (f) for (UINT i = 0; i < n && r + i < 16; i++) memcpy(g_vsShadow[r + i], f + i * 4, 16);
+    if (g_fpProbe == 2 && f && n >= 9) FpProbeUpload(r, f, n);   // build 109
     if (g_replay < 0) dxr::NoteVsConstants(f, n);   // build 056: the synchronous replays know their camera
     if (f && r <= 10 && r + n > 10 && g_uiW) {   // UI screen constants: c10 = (2/1280, -2/UIheight, ...)
         const float* c = f + (10 - r) * 4; float want = -2.0f / (1280.0f * g_uiH / g_uiW);
@@ -1614,6 +1692,12 @@ static void FpFindTarget(void* cam, const float* V, const float* P) {
         float pv[3], tv[3], dist;
         if (o && Readable(o, 0x480) && FpVec(o, posOff, pv) && near3(pv, cp) && FpVec(o, tgtOff, tv) && ahead(tv, &dist)) {
             miss = 0; dxr::SetFpEye(tv, true);
+            memcpy(g_fpTarget, tv, 12); memcpy(g_fpCam, cp, 12); g_fpHave = true;
+            {   // build 109 probe: 5 s and 25 s after first person has been on in the game world (camera 230 from its target)
+                static DWORD onSince; static int shots;
+                if (dxr::FirstPerson() && dist > 100 && dist < 400) { if (!onSince) onSince = nowT; else if (shots < 2 && !g_fpProbe && nowT - onSince > (shots ? 25000u : 5000u)) { shots++; g_fpProbe = 1; } }
+                else onSince = 0;
+            }
             void* vt = *(void* const*)o;
             if (vt != lastVt) { lastVt = vt; Log("fp: camera object %p, class %p", o, vt); }
             if (nLog < 24 && nowT - lastLog > 10000) { lastLog = nowT; nLog++; Log("fp: camera %.0f %.0f %.0f, target %.0f %.0f %.0f, distance %.0f, target is %.0f above the camera", cp[0], cp[1], cp[2], tv[0], tv[1], tv[2], dist, tv[1] - cp[1]); }
@@ -1636,7 +1720,7 @@ static void FpFindTarget(void* cam, const float* V, const float* P) {
                 float tv[3], dist; if (!FpVec(o, t, tv) || !ahead(tv, &dist)) continue;
                 ptrOff = po; posOff = a; tgtOff = t; miss = 0;
                 Log("fp: camera target found - object %p (camera entry +0x%x, class %p): position at +0x%x, target at +0x%x, distance %.0f units", o, po < 0 ? 0 : po, *(void* const*)o, a, t, dist);
-                {   // one-off notes for development: the floats around the two vectors, and objects this one points to that hold a
+                if (0) {   // one-off notes for development: the floats around the two vectors, and objects this one points to that hold a
                     // position under the target (the character?)
                     int lo = (a < t ? a : t) - 0x20; if (lo < 0) lo = 0; int hi = (a > t ? a : t) + 0x30; if (hi > lim) hi = lim;
                     for (int q = lo; q < hi; q += 16) { float f[4] = { 0 }; memcpy(f, o + q, (hi - q) >= 16 ? 16 : (hi - q)); Log("fp:   +0x%03x  %12.3f %12.3f %12.3f %12.3f", q, f[0], f[1], f[2], f[3]); }
