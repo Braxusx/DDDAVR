@@ -560,7 +560,7 @@ static FpVsInfo g_fpVsI[256]; static int g_fpVsN; static int g_fpDraws, g_fpLogg
 struct MmTex { IDirect3DTexture9* t; UINT w, h; int fmt, bpp; std::vector<uint8_t> shadow; void* bits; int pitch; RECT rc; bool locked; int locks; };
 static MmTex g_mm[6]; static int g_mmN; static CRITICAL_SECTION g_mmCs; static bool g_mmCsInit;
 // build 112: per-frame record of the player's skeleton (first 120 bones of slot 0,0) with the character position, while measuring
-static HANDLE g_boneFile = INVALID_HANDLE_VALUE; static volatile bool g_boneRec; static volatile long g_camSeq; static long g_boneN;
+static HANDLE g_boneFile = INVALID_HANDLE_VALUE; static volatile bool g_boneRec; static volatile long g_camSeq; static long g_boneN, g_boneN2;
 static float g_fpRoot[3], g_fpEyeDbg[3]; static volatile bool g_fpRootOk;
 // build 113: the player's neck and head bone matrices (bones 14, 15 of skeleton slot 0,0; joint solved from the 112 recording), copied
 // from the bone texture as the game writes it, with the character position they belong to
@@ -616,10 +616,10 @@ static void MmUnlock(IDirect3DTexture9* t) {
     EnterCriticalSection(&g_mmCs);
     for (int i = 0; i < g_mmN; i++) { MmTex& m = g_mm[i]; if (m.t != t || !m.locked) continue;
         m.locked = false;
-        if (g_boneRec && g_boneFile != INVALID_HANDLE_VALUE && m.bits && m.w == 1024 && m.h == 64 && m.bpp == 16 && m.rc.top == 0 && m.rc.left == 0 && m.rc.right >= 360 && m.rc.bottom >= 1) {
+        if (g_boneRec && g_boneFile != INVALID_HANDLE_VALUE && m.bits && m.w == 1024 && m.h == 64 && m.bpp == 16 && m.rc.top == 0 && m.rc.left == 0 && m.rc.right >= 1024 && m.rc.bottom >= 4 && m.pitch == 16384 && (g_boneN2++ % 3) == 0) {   // build 114: rows 0..3, every third frame
             struct { DWORD tick; long seq; float root[3], tgt[3], cam[3], eye[3]; float ok; } h;
             h.tick = GetTickCount(); h.seq = g_camSeq; memcpy(h.root, g_fpRoot, 12); memcpy(h.tgt, g_fpTarget, 12); memcpy(h.cam, g_fpCam, 12); memcpy(h.eye, g_fpEyeDbg, 12); h.ok = g_fpRootOk ? 1.0f : 0.0f;
-            DWORD wr; WriteFile(g_boneFile, &h, sizeof h, &wr, nullptr); WriteFile(g_boneFile, m.bits, 360 * 16, &wr, nullptr); g_boneN++;
+            DWORD wr; WriteFile(g_boneFile, &h, sizeof h, &wr, nullptr); WriteFile(g_boneFile, m.bits, 4096 * 16, &wr, nullptr); g_boneN++;
         }
         if (g_fpWantBones && m.bits && m.w == 1024 && m.h == 64 && m.bpp == 16 && m.rc.top == 0 && m.rc.left == 0 && m.rc.right >= 48 && m.rc.bottom >= 1) {
             memcpy(g_plBone, m.bits, sizeof g_plBone); memcpy(g_plBoneRoot, g_fpRoot, 12); g_plBoneSeq = g_camSeq;

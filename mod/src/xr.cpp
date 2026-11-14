@@ -296,7 +296,7 @@ static int g_track = 1, g_headPos = 1, g_lag = 0; static float g_scale = 100.0f;
 static bool g_frameOpen; static XrFrameState g_fs{ XR_TYPE_FRAME_STATE };
 static Q g_refYaw{ 0, 0, 0, 1 }; static float g_refPos[3]; static bool g_refSet, g_wantRef;
 static long g_camCalls, g_camApplied;
-static int g_fp, g_autoRecenter = 1; static float g_fpUp, g_fpFwd = 0.08f, g_fpHide = 0.22f, g_fpDrop = 0.22f, g_fpEye[3]; static volatile bool g_fpEyeValid, g_fpActive;   // build 108
+static int g_fp, g_autoRecenter = 1; static float g_fpUp, g_fpFwd = 0.08f, g_fpHide = 0.22f, g_fpDrop = 0.0f, g_fpEye[3]; static volatile bool g_fpEyeValid, g_fpActive;   // build 108
 
 void ConfigureTracking(const wchar_t* ini) {
     g_track = GetPrivateProfileIntW(L"VR", L"HeadTracking", 1, ini);
@@ -312,7 +312,7 @@ void ConfigureTracking(const wchar_t* ini) {
     { wchar_t u[32]; GetPrivateProfileStringW(L"VR", L"FpUp", L"0.00", u, 32, ini); g_fpUp = (float)_wtof(u);
       GetPrivateProfileStringW(L"VR", L"FpForward", L"0.08", u, 32, ini); g_fpFwd = (float)_wtof(u);
       GetPrivateProfileStringW(L"VR", L"FpHide", L"0.22", u, 32, ini); g_fpHide = (float)_wtof(u);
-      GetPrivateProfileStringW(L"VR", L"FpMarkerDrop", L"0.22", u, 32, ini); g_fpDrop = (float)_wtof(u); }
+      GetPrivateProfileStringW(L"VR", L"FpMarkerDrop", L"0.00", u, 32, ini); g_fpDrop = (float)_wtof(u); }
     g_autoRecenter = GetPrivateProfileIntW(L"VR", L"AutoRecenter", 1, ini);
     Log("xr: FirstPerson=%d (F2 switches; eye %.2f m up, %.2f m forward of the character's head position; own body hidden within %.2f m) AutoRecenter=%d", g_fp, g_fpUp, g_fpFwd, g_fpHide, g_autoRecenter);
 }

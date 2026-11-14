@@ -4,7 +4,7 @@
 set -e
 TC=${TC:?set TC to the llvm-mingw bin folder}
 cd "$(dirname "$0")"
-N=${1:-113}
+N=${1:-114}
 CC=$TC/i686-w64-mingw32-clang; CXX=$TC/i686-w64-mingw32-clang++
 MH=third_party/minhook
 mkdir -p build/obj
