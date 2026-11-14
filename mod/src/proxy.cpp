@@ -580,14 +580,17 @@ static uint16_t g_slotSeen[16 * 1024];   // per first texel of a skeleton: the c
 struct EqSlot { int idx; long seq; }; static EqSlot g_eqSlot[16]; static float g_plBone0Raw[12]; static int g_fpTurn = -1;
 // what was written, bone by bone, and what the game had there: a bone the game has not rewritten since is put back before
 // anything else (the game does not rewrite every bone every frame; 121 turned those again and again, and turned stale ones for good)
-struct TurnRec { int idx, n; float raw[96][12], wr[96][12]; }; static TurnRec g_turnRec[17]; volatile bool g_fpTurnDirty;
+struct TurnRec { int idx, n; float raw[96][12], wr[96][12]; }; static TurnRec g_turnRecT[4][17]; static TurnRec* g_turnRec = g_turnRecT[0]; static bool g_turnDirtyT[4]; volatile bool g_fpTurnDirty;
+// build 125 diagnostics (logged every 10 s): bones found still holding what the mod wrote (the game did not rewrite them), per
+// texture; how old the bound bone texture was at the player's draws; and whether it changed between the left and right replay
+static volatile long g_dgStalePl, g_dgStaleEq, g_dgUnlock, g_dgDepth[6], g_dgEyeMis, g_dgNoTex, g_dgFrames; static void* g_dgTexSeen[6]; static int g_dgTexN; static char g_dgOrder[64]; static int g_dgOrderN;
 struct ChrT { float x, y, z; }; static ChrT g_chrT[32]; static volatile int g_chrN;   // other characters' bone-0 places (scale 200+)
-static void FpTurnRestore(float* tex, int rows) {
-    const int lim = rows * 1024; bool any = false;
+static void FpTurnRestore(float* tex, int rows, int ti) {
+    const int lim = rows * 1024; g_turnRec = g_turnRecT[ti];
     for (int k = 0; k < 17; k++) { TurnRec& r = g_turnRec[k];
-        for (int i = 0; i < r.n; i++) { if (r.idx + (i + 1) * 3 > lim) break; float* t = tex + (r.idx + i * 3) * 4; if (!memcmp(t, r.wr[i], 48)) memcpy(t, r.raw[i], 48); }
+        for (int i = 0; i < r.n; i++) { if (r.idx + (i + 1) * 3 > lim) break; float* t = tex + (r.idx + i * 3) * 4; if (!memcmp(t, r.wr[i], 48)) { memcpy(t, r.raw[i], 48); if (k == 0) InterlockedIncrement(&g_dgStalePl); else InterlockedIncrement(&g_dgStaleEq); } }
         r.n = 0; }
-    (void)any; g_fpTurnDirty = false;
+    g_turnDirtyT[ti] = false; g_fpTurnDirty = g_turnDirtyT[0] || g_turnDirtyT[1] || g_turnDirtyT[2] || g_turnDirtyT[3];
 }
 // build 124: whose equipment. A worn or carried piece is driven by one of the player's joints, so one of its first bones stays in a
 // fixed relation to one of the player's bones (inverse(player bone) x piece bone is constant) while the player moves; nothing of
@@ -596,7 +599,8 @@ static void FpTurnRestore(float* tex, int rows) {
 // (123 went by a steady distance, which simulated or swinging pieces fail - they stayed unturned beside the turned body.)
 struct Trk { int idx; bool owned, refOk; int nb; uint64_t alive[4]; float ref[4][48][12]; float path, bad; int away; long seq; };
 static Trk g_trk[20]; static float g_trkRoot[3], g_trkPsi; static float g_turnPath; static bool g_trkInit;
-static void FpTurnSkeletons(float* tex, int rows) {
+static void FpTurnSkeletons(float* tex, int rows, int ti) {
+    g_turnRec = g_turnRecT[ti];
     const long now = g_camSeq; const int lim = rows * 1024;
     const float psi = atan2f(tex[2], tex[10]);
     float step = 0; if (g_trkInit) { const float a = g_fpRoot[0] - g_trkRoot[0], b = g_fpRoot[1] - g_trkRoot[1], c2 = g_fpRoot[2] - g_trkRoot[2]; step = sqrtf(a * a + b * b + c2 * c2); if (step > 60) step = 0;
@@ -665,7 +669,7 @@ static void FpTurnSkeletons(float* tex, int rows) {
             const float tx = r0[3] - cx, tz = r2[3] - cz; r0[3] = c * tx + sn * tz + cx; r2[3] = -sn * tx + c * tz + cz;
             memcpy(r.wr[i], r0, 48);
         }
-        g_fpTurnDirty = true;
+        g_turnDirtyT[ti] = true; g_fpTurnDirty = true;
     }
 }
 static const float kFpEyeUp = 9.0f, kFpEyeFwd = 8.0f;   // eyes from the head joint, game units
@@ -731,14 +735,17 @@ static void MmUnlock(IDirect3DTexture9* t) {
             h.tick = GetTickCount(); h.seq = g_camSeq; memcpy(h.root, g_fpRoot, 12); memcpy(h.tgt, g_fpTarget, 12); memcpy(h.cam, g_fpCam, 12); memcpy(h.eye, g_fpEyeDbg, 12); h.ok = g_fpRootOk ? 1.0f : 0.0f;
             DWORD wr; WriteFile(g_boneFile, &h, sizeof h, &wr, nullptr); WriteFile(g_boneFile, m.bits, 4096 * 16, &wr, nullptr); g_boneN++;
         }
-        if (g_fpTurnDirty && m.bits && m.w == 1024 && m.h == 64 && m.bpp == 16 && m.rc.top == 0 && m.rc.left == 0 && m.rc.right >= 1024 && m.pitch == 16384) FpTurnRestore((float*)m.bits, m.rc.bottom < 16 ? (int)m.rc.bottom : 16);
+        int ti = -1;   // this texture's place among the (three) bone textures
+        if (m.bits && m.w == 1024 && m.h == 64 && m.bpp == 16) { int old = 0; for (int i2 = 0; i2 < 4; i2++) { if (g_tb[i2].t == m.t) { ti = i2; break; } if (g_tb[i2].seq < g_tb[old].seq) old = i2; }
+            if (ti < 0) { ti = old; g_tb[ti].t = m.t; g_tb[ti].seq = 0; for (int k = 0; k < 17; k++) g_turnRecT[ti][k].n = 0; g_turnDirtyT[ti] = false; }
+            InterlockedIncrement(&g_dgUnlock); if (g_dgOrderN < 60) g_dgOrder[g_dgOrderN++] = (char)('A' + ti); }
+        if (ti >= 0 && g_turnDirtyT[ti] && m.rc.top == 0 && m.rc.left == 0 && m.rc.right >= 1024 && m.pitch == 16384) FpTurnRestore((float*)m.bits, m.rc.bottom < 16 ? (int)m.rc.bottom : 16, ti);
         if (g_fpWantBones && m.bits && m.w == 1024 && m.h == 64 && m.bpp == 16 && m.rc.top == 0 && m.rc.left == 0 && m.rc.right >= 48 && m.rc.bottom >= 1) {
             memcpy(g_plBone0Raw, m.bits, 48);
             if (g_fpTurn < 0) g_fpTurn = GetPrivateProfileIntW(L"VR", L"FpTurnBody", 1, g_ini);
-            if (g_fpQok && m.rc.right >= 1024 && m.pitch == 16384) FpTurnSkeletons((float*)m.bits, m.rc.bottom < 16 ? (int)m.rc.bottom : 16);
+            if (ti >= 0 && g_fpQok && m.rc.right >= 1024 && m.pitch == 16384) FpTurnSkeletons((float*)m.bits, m.rc.bottom < 16 ? (int)m.rc.bottom : 16, ti);
             memcpy(g_plBone, m.bits, sizeof g_plBone); memcpy(g_plBoneRoot, g_fpRoot, 12); g_plBoneSeq = g_camSeq;
-            {   TexBones* e = &g_tb[0]; for (int i2 = 0; i2 < 4; i2++) { if (g_tb[i2].t == m.t) { e = &g_tb[i2]; break; } if (g_tb[i2].seq < e->seq) e = &g_tb[i2]; }
-                e->t = m.t; memcpy(e->b, m.bits, sizeof e->b); e->seq = g_camSeq; }
+            if (ti >= 0) { TexBones* e = &g_tb[ti]; memcpy(e->b, m.bits, sizeof e->b); e->seq = g_camSeq; }
             if (m.pitch == 16384) { const int rows = m.rc.bottom < 16 ? (int)m.rc.bottom : 16; memcpy(g_boneTex, m.bits, (size_t)rows * 16384); g_boneTexOk = true; }
         }
         if (g_fpProbe && m.bits && m.rc.left >= 0 && m.rc.top >= 0 && m.rc.right <= (LONG)m.w && m.rc.bottom <= (LONG)m.h)
@@ -786,7 +793,14 @@ static int FpClipPre(IDirect3DDevice9* d) {
     {   const int tx = (int)(sk[1] * 1024.0f + 0.5f), ty = (int)(sk[2] * 64.0f + 0.5f); if (tx >= 0 && tx < 1024 && ty >= 0 && ty < 16) g_slotSeen[ty * 1024 + tx] = (uint16_t)g_camSeq; }
     if (v->shadow) return 0;
     const float (*pb)[12] = g_plBone; long pbSeq = g_plBoneSeq;
-    {   IDirect3DBaseTexture9* bt = nullptr; if (SUCCEEDED(d->GetTexture(D3DVERTEXTEXTURESAMPLER0 + v->samp, &bt)) && bt) { for (int i = 0; i < 4; i++) if ((void*)g_tb[i].t == (void*)bt) { pb = g_tb[i].b; pbSeq = g_tb[i].seq; break; } bt->Release(); } }
+    bool texFound = false;
+    {   IDirect3DBaseTexture9* bt = nullptr; if (SUCCEEDED(d->GetTexture(D3DVERTEXTEXTURESAMPLER0 + v->samp, &bt)) && bt) { for (int i = 0; i < 4; i++) if ((void*)g_tb[i].t == (void*)bt) { pb = g_tb[i].b; pbSeq = g_tb[i].seq; texFound = true; break; } bt->Release(); } }
+    if (sk[1] == 0.0f && sk[2] == 0.0f) {   // the player's draws
+        static long seq0 = -1, counted = -1, frameSeq = -1;
+        if (!texFound) InterlockedIncrement(&g_dgNoTex);
+        else if (g_replay == 0) { if (pbSeq != frameSeq) { frameSeq = pbSeq; seq0 = pbSeq; InterlockedIncrement(&g_dgFrames); long dp = g_camSeq - pbSeq; if (dp < 0) dp = 0; if (dp > 5) dp = 5; InterlockedIncrement(&g_dgDepth[dp]); } }
+        else if (g_replay == 1 && pbSeq != seq0 && counted != pbSeq) { counted = pbSeq; InterlockedIncrement(&g_dgEyeMis); }
+    }
     if (sk[1] != 0.0f || sk[2] != 0.0f) {
         // build 119: another skeleton. Equipment carried by the player (bow, quiver, shield, sheathed weapons: small models,
         // bone scale under 200 where characters have 240 and more, sitting on the player) is not drawn behind the chest's back
@@ -2055,12 +2069,19 @@ static void FpFindTarget(void* cam, const float* V, const float* P) {
                     }
                 }
                 g_fpHideOn = ok && dxr::FirstPerson(); g_fpWantBones = g_fpHideOn; g_fpRootOk = ok; InterlockedIncrement(&g_camSeq);
+                { static DWORD lastD; if (g_fpHideOn && nowT - lastD > 10000) { lastD = nowT; g_dgOrder[g_dgOrderN < 63 ? g_dgOrderN : 63] = 0;
+                    Log("fp: diag - %ld bone-texture unlocks (order %s), player frames drawn %ld, bone texture age at draw 0:%ld 1:%ld 2:%ld 3:%ld 4:%ld 5+:%ld camera frames, changed between left and right eye %ld times, texture unknown %ld draws; bones the game had not rewritten: player %ld, equipment %ld",
+                        InterlockedExchange(&g_dgUnlock, 0), g_dgOrder, InterlockedExchange(&g_dgFrames, 0), InterlockedExchange(&g_dgDepth[0], 0), InterlockedExchange(&g_dgDepth[1], 0), InterlockedExchange(&g_dgDepth[2], 0), InterlockedExchange(&g_dgDepth[3], 0), InterlockedExchange(&g_dgDepth[4], 0), InterlockedExchange(&g_dgDepth[5], 0),
+                        InterlockedExchange(&g_dgEyeMis, 0), InterlockedExchange(&g_dgNoTex, 0), InterlockedExchange(&g_dgStalePl, 0), InterlockedExchange(&g_dgStaleEq, 0)); g_dgOrderN = 0; } }
                 { static DWORD lastC; if (g_fpHideOn && nowT - lastC > 10000) { lastC = nowT; Log("fp: own-body cut used on %ld draws, carried-equipment cut on %ld draws in the last 10 s", InterlockedExchange(&g_fpClipped, 0), InterlockedExchange(&g_fpClippedEq, 0)); } }
                 if ((int)ok != state) { state = ok; Log("fp: %s (camera class %p, distance %.0f)", ok ? "character found under the camera target - first person available" : "no character under the camera target - first person paused", *(void* const*)o, dist); }
             }
             memcpy(g_fpTarget, tv, 12); memcpy(g_fpCam, cp, 12); g_fpHave = true;
             {   // build 110: End = 20 s measurement (see FpProbeDraw)
                 static bool endP; static DWORD lastSample; static bool was;
+                {   static bool f3P; const bool f3 = (GetAsyncKeyState(VK_F3) & 0x8000) != 0;   // build 125 (test aid): F3 = body turning on / off
+                    if (f3 && !f3P) { if (g_fpTurn < 0) g_fpTurn = 1; g_fpTurn = !g_fpTurn; Log("fp: body turning %s (F3)", g_fpTurn ? "on" : "off"); dxr::ShowMessage(g_fpTurn ? L"Body turning ON" : L"Body turning OFF", 2.0); }
+                    f3P = f3; }
                 struct Cand { int ptr, off; }; static Cand cand[72]; static int nCand;
                 bool endK = (GetAsyncKeyState(VK_END) & 0x8000) != 0;
                 if (endK && !endP && !g_fpMeasureUntil) {
