@@ -296,7 +296,7 @@ static int g_track = 1, g_headPos = 1, g_lag = 0; static float g_scale = 100.0f;
 static bool g_frameOpen; static XrFrameState g_fs{ XR_TYPE_FRAME_STATE };
 static Q g_refYaw{ 0, 0, 0, 1 }; static float g_refPos[3]; static bool g_refSet, g_wantRef;
 static long g_camCalls, g_camApplied;
-static int g_fp, g_autoRecenter = 1; static float g_fpUp, g_fpFwd = 0.08f, g_fpHide = 0.22f, g_fpDrop = 0.0f, g_fpEye[3]; static volatile bool g_fpEyeValid, g_fpActive;   // build 108
+static int g_fp, g_autoRecenter = 1; static float g_fpUp, g_fpFwd = 0.08f, g_fpHide = 0.22f, g_fpBarPush = 65.0f, g_fpBarLift = 12.0f, g_fpEye[3]; static volatile bool g_fpEyeValid, g_fpActive;   // build 108
 
 void ConfigureTracking(const wchar_t* ini) {
     g_track = GetPrivateProfileIntW(L"VR", L"HeadTracking", 1, ini);
@@ -312,7 +312,8 @@ void ConfigureTracking(const wchar_t* ini) {
     { wchar_t u[32]; GetPrivateProfileStringW(L"VR", L"FpUp", L"0.00", u, 32, ini); g_fpUp = (float)_wtof(u);
       GetPrivateProfileStringW(L"VR", L"FpForward", L"0.08", u, 32, ini); g_fpFwd = (float)_wtof(u);
       GetPrivateProfileStringW(L"VR", L"FpHide", L"0.22", u, 32, ini); g_fpHide = (float)_wtof(u);
-      GetPrivateProfileStringW(L"VR", L"FpMarkerDrop", L"0.00", u, 32, ini); g_fpDrop = (float)_wtof(u); }
+      GetPrivateProfileStringW(L"VR", L"FpBarPush", L"65", u, 32, ini); g_fpBarPush = (float)_wtof(u);
+      GetPrivateProfileStringW(L"VR", L"FpBarLift", L"12", u, 32, ini); g_fpBarLift = (float)_wtof(u); }
     g_autoRecenter = GetPrivateProfileIntW(L"VR", L"AutoRecenter", 1, ini);
     Log("xr: FirstPerson=%d (F2 switches; eye %.2f m up, %.2f m forward of the character's head position; own body hidden within %.2f m) AutoRecenter=%d", g_fp, g_fpUp, g_fpFwd, g_fpHide, g_autoRecenter);
 }
@@ -529,7 +530,6 @@ bool SyncVS(float* f, unsigned n) {   // VS constant upload during a replay; tru
 // y rms 1.6 UI units, x within the NPC's idle sway). So: the ray from the band position in the head view, the distance from the
 // game-axis depth, then this eye's real projection.
 bool WorldGuiToEye(int mode, float x, float y, float z, float* X, float* Y, float* k, float* rs, float* rc) {
-    (void)mode;
     if (g_replayEye < 0 || g_replayCam < 0) return false;
     const SyncCam& c = g_cams[g_replayCam];
     if (!c.valid || !c.mh || !c.xs0 || !c.ys0) return false;
@@ -541,9 +541,18 @@ bool WorldGuiToEye(int mode, float x, float y, float z, float* X, float* Y, floa
     float t = fabsf(a) > 1e-4f ? (s * z - b) / a : z;
     if (t < 1.0f) t = z;
     float pe[4] = { r[0] * t, r[1] * t, r[2] * t, 1.0f };
-    if (c.fp && g_fpDrop != 0) {   // build 113: in first person the game's marker points come out about 22 cm too high in the world
-        // (third person / first person comparison on one NPC, 112 recording); world up in the view = row 1 of V
-        const float d = g_fpDrop * g_scale; pe[0] -= c.V[4] * d; pe[1] -= c.V[5] * d; pe[2] -= c.V[6] * d;
+    if (c.fp && (mode & 0x100) && g_fpBarPush != 0) {
+        // build 115: a pawn's / NPC's name and health bar is placed by the game about 65 units from the head towards its own camera
+        // (measured against Rook's tracked head, first and third person: 54..68 along the game camera's ray, about 21 above the
+        // head joint). From the third-person camera that shift cannot be seen; from the first-person eye the bar hangs in front of
+        // the character. Put it back along that ray and lift it clear of the head.
+        float pg[3]; for (int j = 0; j < 3; j++) pg[j] = pe[0] * Mi[j] + pe[1] * Mi[4 + j] + pe[2] * Mi[8 + j] + Mi[12 + j];   // game view (camera at 0)
+        const float l = sqrtf(pg[0] * pg[0] + pg[1] * pg[1] + pg[2] * pg[2]);
+        if (l > 1.0f) {
+            const float f = (l + g_fpBarPush) / l; for (int j = 0; j < 3; j++) pg[j] *= f;
+            float pn[3]; for (int j = 0; j < 3; j++) pn[j] = pg[0] * c.Mh[j] + pg[1] * c.Mh[4 + j] + pg[2] * c.Mh[8 + j] + c.Mh[12 + j];
+            pe[0] = pn[0] + c.V[4] * g_fpBarLift; pe[1] = pn[1] + c.V[5] * g_fpBarLift; pe[2] = pn[2] + c.V[6] * g_fpBarLift;   // world up = row 1 of V
+        }
     }
     if (g_replayEye == 1) { float pr[4]; for (int j = 0; j < 4; j++) { pr[j] = 0; for (int i = 0; i < 4; i++) pr[j] += pe[i] * c.T[i * 4 + j]; } memcpy(pe, pr, 16); }
     float cl[4]; for (int j = 0; j < 4; j++) { cl[j] = 0; for (int i = 0; i < 4; i++) cl[j] += pe[i] * P[i * 4 + j]; }

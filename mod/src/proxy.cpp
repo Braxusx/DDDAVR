@@ -1465,7 +1465,11 @@ static int UiTweakPre(IDirect3DDevice9* d, Tweak& tw) {
     }
     if (g_worldGui && g_replay >= 0 && g_uiScene && IsWorldEl(c4)) {
         float X, Y, k, rs = 0, rc = 1;
-        if (dxr::WorldGuiToEye(g_worldGui, c4[0], c4[1], c4[2], &X, &Y, &k, &rs, &rc)) {
+        // build 115: a name / health bar = several pieces at one depth (last frame's group at this place had an extent); a quest
+        // marker is a single piece
+        bool bar = false; for (int i = 0; i < g_gPrevN && !bar; i++) { const WGrp& g = g_gPrev[i];
+            bar = fabsf(g.z - c4[2]) < 8.0f && c4[0] > g.x0 - 80.0f && c4[0] < g.x1 + 80.0f && c4[1] > g.y0 - 80.0f && c4[1] < g.y1 + 80.0f && (g.x1 - g.x0 > 4.0f || g.y1 - g.y0 > 4.0f); }
+        if (dxr::WorldGuiToEye(g_worldGui | (bar ? 0x100 : 0), c4[0], c4[1], c4[2], &X, &Y, &k, &rs, &rc)) {
             memcpy(tw.vs[1], g_vsShadow[1], 32); memcpy(tw.vs[4], c4, 16); memcpy(tw.vs[10], c10, 16);
             k *= g_wmScale;
             float m[2][4]; memcpy(m, g_vsShadow[1], 32);
