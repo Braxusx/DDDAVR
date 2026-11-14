@@ -555,14 +555,14 @@ static volatile int g_fpProbe;   // 1 = armed, 2 = saw the other replay, 3 = rec
 static volatile DWORD g_fpMeasureUntil; static int g_fpMeasureN;
 static float g_fpTarget[3], g_fpCam[3]; static volatile bool g_fpHave;
 static float g_vsLow[64][4];     // vertex shader constants c0..c63 as last uploaded (kept only while measuring)
-struct FpVsInfo { IDirect3DVertexShader9* vs; int skinReg, invReg, samp; };
-static FpVsInfo g_fpVsI[96]; static int g_fpVsN; static int g_fpDraws, g_fpLogged;
+struct FpVsInfo { IDirect3DVertexShader9* vs; int skinReg, invReg, samp, shadow; };
+static FpVsInfo g_fpVsI[256]; static int g_fpVsN; static int g_fpDraws, g_fpLogged;
 struct MmTex { IDirect3DTexture9* t; UINT w, h; int fmt, bpp; std::vector<uint8_t> shadow; void* bits; int pitch; RECT rc; bool locked; int locks; };
 static MmTex g_mm[6]; static int g_mmN; static CRITICAL_SECTION g_mmCs; static bool g_mmCsInit;
 static const FpVsInfo* FpVs(IDirect3DVertexShader9* vs) {
     for (int i = 0; i < g_fpVsN; i++) if (g_fpVsI[i].vs == vs) return &g_fpVsI[i];
-    if (!vs || g_fpVsN >= 96) return nullptr;
-    FpVsInfo& v = g_fpVsI[g_fpVsN++]; v = { vs, -1, -1, -1 };
+    if (!vs || g_fpVsN >= 256) return nullptr;
+    FpVsInfo& v = g_fpVsI[g_fpVsN++]; v = { vs, -1, -1, -1, 0 };
     UINT sz = 0; if (FAILED(vs->GetFunction(nullptr, &sz)) || sz < 32 || sz > 262144) return &v;
     std::vector<DWORD> fn(sz / 4 + 1); if (FAILED(vs->GetFunction(fn.data(), &sz))) return &v;
     const size_t nt = sz / 4; char line[900]; int ln = 0; line[0] = 0;
@@ -577,6 +577,7 @@ static const FpVsInfo* FpVs(IDirect3DVertexShader9* vs) {
                 if (nameOff >= bl) continue;
                 const char* nm = (const char*)b + nameOff; if (strnlen(nm, bl - nameOff) >= bl - nameOff) continue;
                 if (rset == 2 && strstr(nm, "CBSkinning")) v.skinReg = ridx;
+                if (strstr(nm, "CBShadowCast")) v.shadow = 1;
                 if (rset == 2 && strstr(nm, "tMatrixMap__invsize")) v.invReg = ridx;
                 if (rset == 3 && strstr(nm, "tMatrixMap")) v.samp = ridx;
                 if (rset != 2 && rset != 3) continue;
@@ -587,7 +588,7 @@ static const FpVsInfo* FpVs(IDirect3DVertexShader9* vs) {
         }
         i += len + 1;
     }
-    if (v.samp >= 0) Log("probe: skinned vs %p:%s", vs, line);
+    if (v.samp >= 0 && g_fpProbe) Log("probe: skinned vs %p:%s", vs, line);
     return &v;
 }
 static void MmLock(IDirect3DTexture9* t, D3DLOCKED_RECT* lr, const RECT* rc, DWORD fl) {
@@ -640,6 +641,19 @@ static void FpProbeDraw(IDirect3DDevice9* d, UINT prims, UINT verts) {
     static const float z4[4] = { 0, 0, 0, 0 }; if (!sk) sk = z4; if (!iv) iv = z4;
     g_fpLogged++;
     Log("probe: skin %d prims %u verts %u vs %p map %p | c%d %.6g %.6g %.6g %.6g | inv %.6g %.6g %.6g %.6g", g_fpDraws, prims, verts, g_curVS, bt, v->skinReg, sk[0], sk[1], sk[2], sk[3], iv[0], iv[1], iv[2], iv[3]);
+}
+// build 111: first person - the player's own skinned meshes (skeleton slot 0,0 of the bone texture; not the shadow passes) are
+// drawn with a clip plane that removes everything within FpHide of the eye plane: the head goes, the body stays when looking down
+static volatile bool g_fpHideOn; static long g_fpClipped;
+static HRESULT FpSetRS(IDirect3DDevice9* d, D3DRENDERSTATETYPE st, DWORD v);
+static bool FpClipPre(IDirect3DDevice9* d) {
+    const FpVsInfo* v = FpVs(g_curVS);
+    if (!v || v->samp < 0 || v->shadow || v->skinReg < 0 || v->skinReg >= 64) return false;
+    const float* sk = g_vsLow[v->skinReg];
+    if (sk[1] != 0.0f || sk[2] != 0.0f || sk[0] <= 0.0f) return false;
+    float pl[4]; if (!dxr::FpClipPlane(pl)) return false;
+    d->SetClipPlane(0, pl); FpSetRS(d, D3DRS_CLIPPLANEENABLE, D3DCLIPPLANE0); g_fpClipped++;
+    return true;
 }
 static IDirect3DBaseTexture9* g_curTex[8];
 static float g_psc[32][4];
@@ -765,6 +779,7 @@ static HRESULT STDMETHODCALLTYPE hkSetVS(IDirect3DDevice9* d, IDirect3DVertexSha
     extern bool IsGuiVS(void* p);
     g_curVSF = p ? (IsGuiVS(p) ? VSF_GUI : 0) | ((g_primN && IsPrimVS(p)) ? VSF_PRIM : 0) | ((g_primN && IsPrimShiftVS(p)) ? VSF_PRIMSHIFT : 0) | ((g_flareN && IsFlareVS(p)) ? VSF_FLARE : 0) : 0;
     return oSetVS(d, p); }
+static HRESULT FpSetRS(IDirect3DDevice9* d, D3DRENDERSTATETYPE st, DWORD v) { return oSetRS(d, st, v); }
 static HRESULT STDMETHODCALLTYPE hkSetRS(IDirect3DDevice9* d, D3DRENDERSTATETYPE s, DWORD v) { HPScope _hp(HP_SetRS);
     switch (s) {
     case D3DRS_ALPHABLENDENABLE: g_rsAlpha = v; break; case D3DRS_SRCBLEND: g_rsSrc = v; break; case D3DRS_DESTBLEND: g_rsDst = v; break;
@@ -1514,7 +1529,7 @@ template <class F> static void ReticleDraws(IDirect3DDevice9* d, const Tweak& tw
     float pc[2][4] = { { 0, 0, 0, a * 2.5f }, { 1, 1, 1, 0 } }; oPSC(d, 4, pc[0], 2);
 }
 static HRESULT STDMETHODCALLTYPE hkDP(IDirect3DDevice9* d, D3DPRIMITIVETYPE t, UINT a, UINT b) { R1NoteIfEye(); HPScope _hp(HP_DP); g_fDraws++; if (g_diagOn || CAPON) RefreshTexState(d); if (g_diagOn) DiagDraw(); if (g_inBandRT) return D3D_OK; if (g_movieHold > 0 && (RefreshStream(d), MovieBar(t, a, b))) return D3D_OK; OVERLAY_SKIP(); bool ui = UiPreDraw(d); UI_SKIP(); if (ui && (RefreshStream(d), ParkedIcon(t, a, b))) { UiPost(d, ui); return D3D_OK; } if (CAPON) { g_da = { 1, t, a, 0, b, nullptr, 0, 0, b, d }; CapDraw(RA, b); PostRec(RA, b); } Tweak tw; if (UiTweakPre(d, tw) == TW_RETICLE) ReticleDraws(d, tw, [&] { oDP(d, t, a, b); }); HRESULT hr = oDP(d, t, a, b); if (tw.kind) UiTweakPost(d, tw); UiPost(d, ui); return hr; }
-static HRESULT STDMETHODCALLTYPE hkDIP(IDirect3DDevice9* d, D3DPRIMITIVETYPE t, INT a, UINT b, UINT c, UINT e, UINT f) { R1NoteIfEye(); if (g_fpProbe) FpProbeDraw(d, f, c); for (int k = 0; k < g_intzN; k++) if (g_curDS == g_intz[k].surf) { g_intz[k].draws++; break; } HPScope _hp(HP_DIP); g_fDraws++; if (g_diagOn || CAPON) RefreshTexState(d); if (g_diagOn) DiagDraw(); if (g_inBandRT) return D3D_OK; OVERLAY_SKIP(); if (PrimPre(d, t, a, b, c, e, f)) return D3D_OK; bool ui = UiPreDraw(d); UI_SKIP(); if (CAPON) { g_da = { 2, t, (UINT)a, b, c, nullptr, 0, e, f, d }; CapDraw(RA, f); PostRec(RA, f); } static unsigned dipN; bool timed = g_prof && (++dipN & 15) == 0; double t0 = timed ? NowMs() : 0; Tweak tw; if (UiTweakPre(d, tw) == TW_RETICLE) ReticleDraws(d, tw, [&] { oDIP(d, t, a, b, c, e, f); }); HRESULT hr = oDIP(d, t, a, b, c, e, f); if (tw.kind) UiTweakPost(d, tw); if (timed) g_s.drawMs += (NowMs() - t0) * 16.0; UiPost(d, ui); PrimPost(d); return hr; }
+static HRESULT STDMETHODCALLTYPE hkDIP(IDirect3DDevice9* d, D3DPRIMITIVETYPE t, INT a, UINT b, UINT c, UINT e, UINT f) { R1NoteIfEye(); if (g_fpProbe) FpProbeDraw(d, f, c); const bool fpClip = g_fpHideOn && FpClipPre(d); for (int k = 0; k < g_intzN; k++) if (g_curDS == g_intz[k].surf) { g_intz[k].draws++; break; } HPScope _hp(HP_DIP); g_fDraws++; if (g_diagOn || CAPON) RefreshTexState(d); if (g_diagOn) DiagDraw(); if (g_inBandRT) return D3D_OK; OVERLAY_SKIP(); if (PrimPre(d, t, a, b, c, e, f)) return D3D_OK; bool ui = UiPreDraw(d); UI_SKIP(); if (CAPON) { g_da = { 2, t, (UINT)a, b, c, nullptr, 0, e, f, d }; CapDraw(RA, f); PostRec(RA, f); } static unsigned dipN; bool timed = g_prof && (++dipN & 15) == 0; double t0 = timed ? NowMs() : 0; Tweak tw; if (UiTweakPre(d, tw) == TW_RETICLE) ReticleDraws(d, tw, [&] { oDIP(d, t, a, b, c, e, f); }); HRESULT hr = oDIP(d, t, a, b, c, e, f); if (fpClip) oSetRS(d, D3DRS_CLIPPLANEENABLE, 0); if (tw.kind) UiTweakPost(d, tw); if (timed) g_s.drawMs += (NowMs() - t0) * 16.0; UiPost(d, ui); PrimPost(d); return hr; }
 static HRESULT STDMETHODCALLTYPE hkDPUP(IDirect3DDevice9* d, D3DPRIMITIVETYPE t, UINT a, const void* p, UINT s) { R1NoteIfEye(); g_fDraws++; if (g_diagOn || CAPON) RefreshTexState(d); if (g_diagOn) DiagDraw(); g_s.drawsUP++; OVERLAY_SKIP(); bool ui = UiPreDraw(d); UI_SKIP(); if (CAPON) { g_da = { 3, t, 0, 0, a, p, s, 0, a, d }; CapDraw(RA, a); PostRec(RA, a); } HRESULT hr = oDPUP(d, t, a, p, s); UiPost(d, ui); return hr; }
 static HRESULT STDMETHODCALLTYPE hkDIPUP(IDirect3DDevice9* d, D3DPRIMITIVETYPE t, UINT a, UINT b, UINT c, const void* i, D3DFORMAT f, const void* v, UINT s) { R1NoteIfEye();
     g_fDraws++; if (g_diagOn || CAPON) RefreshTexState(d); if (g_diagOn) DiagDraw(); g_s.drawsUP++; OVERLAY_SKIP(); bool ui = UiPreDraw(d); UI_SKIP(); if (CAPON) { g_da = { 4, t, a, b, c, v, s, 0, c, d }; CapDraw(RA, c); PostRec(RA, c); } HRESULT hr = oDIPUP(d, t, a, b, c, i, f, v, s); UiPost(d, ui); return hr;
@@ -1547,7 +1562,7 @@ static long g_capVsc;
 static HRESULT STDMETHODCALLTYPE hkVSC(IDirect3DDevice9* d, UINT r, const float* f, UINT n) { HPScope _hp(HP_VSC);
     g_fVsc++;
     if (f) for (UINT i = 0; i < n && r + i < 16; i++) memcpy(g_vsShadow[r + i], f + i * 4, 16);
-    if (g_fpProbe && f) for (UINT i = 0; i < n && r + i < 64; i++) memcpy(g_vsLow[r + i], f + i * 4, 16);   // build 110
+    if ((g_fpProbe || g_fpHideOn) && f && r < 64) for (UINT i = 0; i < n && r + i < 64; i++) memcpy(g_vsLow[r + i], f + i * 4, 16);   // build 110
     if (g_replay < 0) dxr::NoteVsConstants(f, n);   // build 056: the synchronous replays know their camera
     if (f && r <= 10 && r + n > 10 && g_uiW) {   // UI screen constants: c10 = (2/1280, -2/UIheight, ...)
         const float* c = f + (10 - r) * 4; float want = -2.0f / (1280.0f * g_uiH / g_uiW);
@@ -1711,7 +1726,27 @@ static void FpFindTarget(void* cam, const float* V, const float* P) {
         const uint8_t* o = ptrOff < 0 ? c : *(const uint8_t* const*)(c + ptrOff);
         float pv[3], tv[3], dist;
         if (o && Readable(o, 0x480) && FpVec(o, posOff, pv) && near3(pv, cp) && FpVec(o, tgtOff, tv) && ahead(tv, &dist)) {
-            miss = 0; dxr::SetFpEye(tv, true);
+            miss = 0;
+            {   // build 111: the eye rides on the character itself (camera object +0x70 -> character, position at +0x40 = between the
+                // feet), not on the camera's target, which is smoothed and trails by up to 60 cm when running. Height = the target's
+                // height above the feet, taken while standing. No character under the target (cutscene cameras) -> no first person.
+                static float h; static float lastRoot[3]; static DWORD lastT; static int state = -1;
+                const uint8_t* u = Readable(o + 0x70, 4) ? *(const uint8_t* const*)(o + 0x70) : nullptr; float rp[3]; bool ok = false;
+                if (u && !((uintptr_t)u & 3) && Readable(u, 0x50) && FpVec(u, 0x40, rp)) {
+                    float hx = rp[0] - tv[0], hz = rp[2] - tv[2], dy = tv[1] - rp[1];
+                    ok = hx * hx + hz * hz < 120.f * 120.f && dy > 60 && dy < 260;
+                    if (ok) {
+                        float mv = fabsf(rp[0] - lastRoot[0]) + fabsf(rp[1] - lastRoot[1]) + fabsf(rp[2] - lastRoot[2]);
+                        if (h < 60 || nowT - lastT > 2000) h = dy; else if (mv < 0.5f) h += (dy - h) * 0.05f;
+                        memcpy(lastRoot, rp, 12); lastT = nowT;
+                        float eye[3] = { rp[0], rp[1] + h, rp[2] };
+                        dxr::SetFpEye(eye, true);
+                    }
+                }
+                if (!ok) dxr::SetFpEye(nullptr, false);
+                g_fpHideOn = ok && dxr::FirstPerson();
+                if ((int)ok != state) { state = ok; Log("fp: %s (camera class %p, distance %.0f)", ok ? "character found under the camera target - first person available" : "no character under the camera target - first person paused", *(void* const*)o, dist); }
+            }
             memcpy(g_fpTarget, tv, 12); memcpy(g_fpCam, cp, 12); g_fpHave = true;
             {   // build 110: End = 20 s measurement (see FpProbeDraw)
                 static bool endP; static DWORD lastSample; static bool was;
@@ -1757,7 +1792,7 @@ static void FpFindTarget(void* cam, const float* V, const float* P) {
             return;
         }
         if (++miss < 30) return;   // a few frames of mismatch (camera cut): keep the last target
-        dxr::SetFpEye(nullptr, false);
+        dxr::SetFpEye(nullptr, false); g_fpHideOn = false;
     }
     if (nowT - lastTry < 500) return;
     lastTry = nowT;
@@ -1790,8 +1825,7 @@ static void FpFindTarget(void* cam, const float* V, const float* P) {
                         }
                     }
                 }
-                dxr::SetFpEye(tv, true);
-                return;
+                return;   // build 111: the eye is set from the character on the next frame
             }
         }
     }

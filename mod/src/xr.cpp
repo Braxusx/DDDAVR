@@ -296,7 +296,7 @@ static int g_track = 1, g_headPos = 1, g_lag = 0; static float g_scale = 100.0f;
 static bool g_frameOpen; static XrFrameState g_fs{ XR_TYPE_FRAME_STATE };
 static Q g_refYaw{ 0, 0, 0, 1 }; static float g_refPos[3]; static bool g_refSet, g_wantRef;
 static long g_camCalls, g_camApplied;
-static int g_fp, g_autoRecenter = 1; static float g_fpUp, g_fpFwd = 0.27f, g_fpEye[3]; static volatile bool g_fpEyeValid;   // build 108
+static int g_fp, g_autoRecenter = 1; static float g_fpUp, g_fpFwd = 0.08f, g_fpHide = 0.22f, g_fpEye[3]; static volatile bool g_fpEyeValid, g_fpActive;   // build 108
 
 void ConfigureTracking(const wchar_t* ini) {
     g_track = GetPrivateProfileIntW(L"VR", L"HeadTracking", 1, ini);
@@ -310,15 +310,25 @@ void ConfigureTracking(const wchar_t* ini) {
     // build 108: first person (experimental), automatic recentre
     g_fp = GetPrivateProfileIntW(L"VR", L"FirstPerson", 0, ini);
     { wchar_t u[32]; GetPrivateProfileStringW(L"VR", L"FpUp", L"0.00", u, 32, ini); g_fpUp = (float)_wtof(u);
-      GetPrivateProfileStringW(L"VR", L"FpForward", L"0.27", u, 32, ini); g_fpFwd = (float)_wtof(u); }
+      GetPrivateProfileStringW(L"VR", L"FpForward", L"0.08", u, 32, ini); g_fpFwd = (float)_wtof(u);
+      GetPrivateProfileStringW(L"VR", L"FpHide", L"0.22", u, 32, ini); g_fpHide = (float)_wtof(u); }
     g_autoRecenter = GetPrivateProfileIntW(L"VR", L"AutoRecenter", 1, ini);
-    Log("xr: FirstPerson=%d (F2 switches; eye %.2f m up, %.2f m forward of the camera's target) AutoRecenter=%d", g_fp, g_fpUp, g_fpFwd, g_autoRecenter);
+    Log("xr: FirstPerson=%d (F2 switches; eye %.2f m up, %.2f m forward of the character's head position; own body hidden within %.2f m) AutoRecenter=%d", g_fp, g_fpUp, g_fpFwd, g_fpHide, g_autoRecenter);
 }
 
 // build 108: first person. proxy.cpp finds the game camera's look-at target each frame (SetFpEye); the eye is put there and
 // the view is rebuilt level (the game camera's heading only, world up = +y) before the head pose is applied.
 void SetFpEye(const float* target, bool valid) { if (valid) memcpy(g_fpEye, target, 12); g_fpEyeValid = valid; }
 bool FirstPerson() { return g_fp != 0; }
+// build 111: the player's own meshes are cut away within FpHide metres of the eye plane (head, hair, helmet); the plane is given
+// in clip space for IDirect3DDevice9::SetClipPlane: view depth - d >= 0, with depth = w and 1 = (z + P10 w) / P14
+bool FpClipPlane(float* pl) {
+    if (!g_fpActive || g_fpHide <= 0 || !g_projValid) return false;
+    const float p10 = g_modP[10], p14 = g_modP[14], d = g_fpHide * g_scale;
+    if (fabsf(g_modP[11] + 1) > 1e-3f || fabsf(p14) < 1e-3f) return false;
+    pl[0] = 0; pl[1] = 0; pl[2] = -d / p14; pl[3] = 1 - d * p10 / p14;
+    return true;
+}
 static bool FpView(float* V, bool row, float s) {
     if (!g_fp || !g_fpEyeValid) return false;
     float m[16]; if (row) memcpy(m, V, 64); else for (int i = 0; i < 4; i++) for (int j = 0; j < 4; j++) m[i * 4 + j] = V[j * 4 + i];
@@ -597,7 +607,7 @@ bool ApplyToCamera(float* V, float* P) {
               row ? "row" : "column", s < 0 ? "right" : "left", V[0], V[1], V[2], V[3], V[12], V[13], V[14], V[15], P[0], P[5], P[10], P[11], P[14]);
     float gameV[16]; memcpy(gameV, V, 64);   // build 109: the game's own view, for the world markers in first person
     bool fpOn = false;
-    {   static bool was; bool on = FpView(V, row, s); fpOn = on;   // build 108: first person - the eye at the camera's target, view level
+    {   static bool was; bool on = FpView(V, row, s); fpOn = on; g_fpActive = on;   // build 108: first person - the eye at the camera's target, view level
         if (on != was) { was = on; Log("xr: first person view %s", on ? "on" : g_fp ? "waiting (no camera target found)" : "off"); } }
     // head rotation in the game's view axes (OpenXR: x right, y up, -z forward; left-handed game: flip z)
     Q q = p.rel; if (s > 0) q = { -q.x, -q.y, q.z, q.w };
