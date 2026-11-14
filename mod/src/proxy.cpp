@@ -1884,56 +1884,52 @@ static void FpFindTarget(void* cam, const float* V, const float* P) {
                     }
                 }
                 if (!ok) dxr::SetFpEye(nullptr, false);
-                if (ok && dxr::FirstPerson()) {   // build 119: the body turns with the view while standing (FpTurnBody)
-                    // 118 wrote the rotation quaternion at +0x50; the game put it back every frame (it keeps the heading elsewhere).
-                    // So: every float in the character object that tracks the skeleton's heading (as an angle, either sign, any
-                    // quarter-turn offset) and every quaternion that does are found while the player moves about, and all of them
-                    // are written together.
-                    static int turn = -1; if (turn < 0) turn = GetPrivateProfileIntW(L"VR", L"FpTurnBody", 1, g_ini);
-                    enum { NF = 0x1800 / 4 }; static uint8_t am[NF], qm[NF]; static int nS, state; static float lastPsi = 99, psiMin, psiAcc; static long seqSeen = -1;
-                    struct YF { int off, conv; }; static YF yf[24]; static int nYf; static int qf2[12]; static int nQf;
-                    static int stillN, wrote, wroteTot, noEff; static DWORD lastTl; static float lastErr = -1, wantPsi; static int sinceWrite = -1;
+                if (ok && dxr::FirstPerson()) {   // build 120: body heading study - READ ONLY
+                    // 119 wrote into everything that looked like a heading quaternion; its test (the forward direction only) also
+                    // passed pieces of matrices at +0x28.. and +0x104.., and overwriting those threw the character out of the world.
+                    // Nothing is written any more. This only lists, once, the exact pure-turn quaternions (0, sin a/2, 0, cos a/2)
+                    // and heading angles that follow the skeleton, in the character object and in the objects it points to.
+                    static int study = -1; if (study < 0) study = GetPrivateProfileIntW(L"VR", L"FpHeadingStudy", 1, g_ini);
+                    enum { NP = 0x600 / 4 + 1, NF = 0x400 / 4, NF0 = 0x1800 / 4 };
+                    static uint8_t* am; static uint8_t* qm; static const uint8_t* base[NP]; static int nS, done; static float lastPsi = 99, psiAcc; static long seqSeen = -1;
                     auto wrap = [](float a) { while (a > 3.14159265f) a -= 6.2831853f; while (a < -3.14159265f) a += 6.2831853f; return a; };
                     static const float kC[4] = { 0, 1.5707963f, 3.14159265f, -1.5707963f };
-                    const float* S0 = g_plBone[0]; float bf[2] = { S0[2], S0[10] }; const float bl = sqrtf(bf[0] * bf[0] + bf[1] * bf[1]);
-                    if (turn && bl > 20 && g_plBoneSeq >= 0 && g_camSeq - g_plBoneSeq <= 2) {
-                        const float psiB = atan2f(bf[0], bf[1]);
-                        if (state == 0 && g_plBoneSeq != seqSeen && fabsf(wrap(psiB - lastPsi)) > 0.12f && Readable(u, 0x1800)) {
-                            seqSeen = g_plBoneSeq; const float* fl = (const float*)u;
-                            if (nS == 0) { memset(am, 0xFF, sizeof am); memset(qm, 1, sizeof qm); psiAcc = 0; }
-                            else psiAcc += fabsf(wrap(psiB - lastPsi));
-                            lastPsi = psiB; nS++;
-                            for (int i = 0; i < NF; i++) {
-                                if (am[i]) { const float f = fl[i]; if (!(f > -7.0f && f < 7.0f)) am[i] = 0; else for (int k = 0; k < 8; k++) if ((am[i] >> k) & 1) { const float pr = (k & 4 ? -f : f) + kC[k & 3]; if (fabsf(wrap(pr - psiB)) > 0.04f) am[i] &= ~(1 << k); } }
-                                if (qm[i] && i + 4 <= NF) { const float* q = fl + i; const float qn = q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3];
-                                    const float fx = 2 * (q[0] * q[2] + q[3] * q[1]), fz = 1 - 2 * (q[0] * q[0] + q[1] * q[1]);
-                                    if (fabsf(qn - 1) > 0.02f || fx * bf[0] / bl + fz * bf[1] / bl < 0.97f) qm[i] = 0; } else qm[i] = 0;
-                            }
-                            if (nS >= 40 && psiAcc > 6.0f) {
-                                nYf = nQf = 0; char b2[700]; int n2 = 0; b2[0] = 0;
-                                for (int i = 0; i < NF; i++) if (am[i] && nYf < 24) { int k = 0; while (!((am[i] >> k) & 1)) k++; yf[nYf++] = { i * 4, k }; n2 += snprintf(b2 + n2, sizeof b2 - n2, " +0x%x(%s%s)", i * 4, k & 4 ? "-" : "", (k & 3) == 0 ? "a" : (k & 3) == 1 ? "a+90" : (k & 3) == 2 ? "a+180" : "a-90"); }
-                                n2 += snprintf(b2 + n2, sizeof b2 - n2, " | quaternions:");
-                                for (int i = 0; i < NF; i++) if (qm[i] && nQf < 12) { qf2[nQf++] = i * 4; n2 += snprintf(b2 + n2, sizeof b2 - n2, " +0x%x", i * 4); }
-                                state = (nYf || nQf) ? 1 : -1;
-                                Log("fp: body turn - heading fields in the character object after %d samples: angles:%s%s", nS, b2, state == 1 ? "" : " - none, body turning not available");
+                    const float* S0 = g_plBone[0]; const float bfx = S0[2], bfz = S0[10]; const float bl = sqrtf(bfx * bfx + bfz * bfz);
+                    if (study && !done && bl > 20 && g_plBoneSeq >= 0 && g_camSeq - g_plBoneSeq <= 2 && g_plBoneSeq != seqSeen) {
+                        const float psiB = atan2f(bfx, bfz);
+                        if (fabsf(wrap(psiB - lastPsi)) > 0.12f && Readable(u, 0x1800)) {
+                            seqSeen = g_plBoneSeq;
+                            if (!am) { am = (uint8_t*)malloc((size_t)NP * NF0); qm = (uint8_t*)malloc((size_t)NP * NF0); }
+                            if (am && qm) {
+                                if (nS == 0) { memset(am, 0xFF, (size_t)NP * NF0); memset(qm, 1, (size_t)NP * NF0); psiAcc = 0;
+                                    base[0] = u; for (int p2 = 1; p2 < NP; p2++) { const uint8_t* v = *(const uint8_t* const*)(u + (p2 - 1) * 4); base[p2] = (v && !((uintptr_t)v & 3) && v != u && Readable(v, 0x400)) ? v : nullptr; } }
+                                else psiAcc += fabsf(wrap(psiB - lastPsi));
+                                lastPsi = psiB; nS++;
+                                const float hs = sinf(psiB * 0.5f), hc = cosf(psiB * 0.5f);
+                                for (int p2 = 0; p2 < NP; p2++) {
+                                    const uint8_t* v = base[p2]; if (!v) continue;
+                                    const int nf = p2 ? NF : NF0;
+                                    if (p2 && (*(const uint8_t* const*)(u + (p2 - 1) * 4) != v || !Readable(v, 0x400))) { base[p2] = nullptr; continue; }   // the pointer changed: drop it
+                                    const float* fl = (const float*)v; uint8_t* a2 = am + (size_t)p2 * NF0; uint8_t* q2 = qm + (size_t)p2 * NF0;
+                                    for (int i = 0; i < nf; i++) {
+                                        if (a2[i]) { const float f = fl[i]; if (!(f > -7.0f && f < 7.0f)) a2[i] = 0; else for (int k = 0; k < 8; k++) if ((a2[i] >> k) & 1) { const float pr = (k & 4 ? -f : f) + kC[k & 3]; if (fabsf(wrap(pr - psiB)) > 0.04f) a2[i] &= ~(1 << k); } }
+                                        if (q2[i]) { bool okq = false; if (i + 4 <= nf) { const float* q = fl + i; const float sg = q[3] * hc + q[1] * hs >= 0 ? 1.f : -1.f;
+                                                okq = fabsf(q[0]) < 0.03f && fabsf(q[2]) < 0.03f && fabsf(q[1] - sg * hs) < 0.03f && fabsf(q[3] - sg * hc) < 0.03f; }
+                                            if (!okq) q2[i] = 0; }
+                                    }
+                                }
+                                if (nS >= 40 && psiAcc > 6.0f) {
+                                    done = 1; int nh = 0;
+                                    for (int p2 = 0; p2 < NP; p2++) { if (!base[p2]) continue; const int nf = p2 ? NF : NF0;
+                                        for (int i = 0; i < nf && nh < 60; i++) { const uint8_t a1 = am[(size_t)p2 * NF0 + i], q1 = qm[(size_t)p2 * NF0 + i]; if (!a1 && !q1) continue; nh++;
+                                            int k = 0; if (a1) while (!((a1 >> k) & 1)) k++;
+                                            if (p2) Log("fp: heading study - character +0x%x -> %p (class %p) +0x%x: %s%s%s", (p2 - 1) * 4, base[p2], *(void* const*)base[p2], i * 4, q1 ? "turn quaternion" : "angle ", q1 ? "" : (k & 4 ? "-a" : "a"), q1 ? "" : (k & 3) == 0 ? "" : (k & 3) == 1 ? "+90" : (k & 3) == 2 ? "+180" : "-90");
+                                            else Log("fp: heading study - character +0x%x: %s%s%s", i * 4, q1 ? "turn quaternion" : "angle ", q1 ? "" : (k & 4 ? "-a" : "a"), q1 ? "" : (k & 3) == 0 ? "" : (k & 3) == 1 ? "+90" : (k & 3) == 2 ? "+180" : "-90"); } }
+                                    Log("fp: heading study done - %d fields after %d samples, %.1f rad turned (nothing is written)", nh, nS, psiAcc);
+                                    free(am); free(qm); am = qm = nullptr;
+                                }
                             }
                         }
-                        const float mvv = fabsf(vstep2[0]) + fabsf(vstep2[1]) + fabsf(vstep2[2]);
-                        stillN = mvv < 0.05f ? stillN + 1 : 0;
-                        float lx, lz;
-                        if (state == 1 && stillN >= 12 && dxr::FpLookDir(&lx, &lz) && Readable(u, 0x1800)) {
-                            const float dd = wrap(atan2f(lx, lz) - psiB);
-                            if (fabsf(dd) > 0.12f) {   // 7 degrees of slack; then follow at up to 8 rad/s
-                                const float stepMax = 8.0f / 60.0f; const float np = psiB + (dd > stepMax ? stepMax : dd < -stepMax ? -stepMax : dd);
-                                float* fl = (float*)u;
-                                for (int i = 0; i < nYf; i++) { float& f = fl[yf[i].off / 4]; float t = np - kC[yf[i].conv & 3]; if (yf[i].conv & 4) t = -t; f += wrap(t - f); }   // nearest equivalent angle
-                                for (int i = 0; i < nQf; i++) { float* q = fl + qf2[i] / 4; q[0] = 0; q[1] = sinf(np * 0.5f); q[2] = 0; q[3] = cosf(np * 0.5f); }
-                                wrote++; wroteTot++; wantPsi = np; if (sinceWrite < 0) sinceWrite = 0;
-                                if (++noEff == 240) { state = -2; Log("fp: body turn - the game does not take the written heading (4 s of writing without reaching the view direction); switched off"); }
-                            } else noEff = 0;
-                        }
-                        if (sinceWrite >= 0 && ++sinceWrite == 6) { lastErr = fabsf(wrap(psiB - wantPsi)); sinceWrite = -1; }
-                        if (nowT - lastTl > 10000) { lastTl = nowT; Log("fp: body turn - state %d (%d samples, %.1f rad turned), %d writes in 10 s, skeleton after a write %.2f rad from the written direction", state, nS, psiAcc, wrote, lastErr); wrote = 0; }
                     }
                 }
                 g_fpHideOn = ok && dxr::FirstPerson(); g_fpWantBones = g_fpHideOn; g_fpRootOk = ok; InterlockedIncrement(&g_camSeq);
