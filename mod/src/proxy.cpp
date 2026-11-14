@@ -568,6 +568,8 @@ static float g_plBone[16][12]; static float g_plBoneRoot[3]; static volatile lon
 // build 116: the head joint (the point the neck and head bones share, in the mesh's packed coordinates), the head's own axes from
 // the head bone, and the render thread's measurement of how far the drawn head is from the eye the camera was built with
 static float g_fpQj[3]; static volatile bool g_fpQok; static float g_fpLagD[3]; static volatile long g_fpLagN;
+// build 119: the first 16 rows of the bone texture as last written (every skeleton's bones), for the equipment test
+static float g_boneTex[16][1024][4]; static volatile bool g_boneTexOk; static int g_fpHideBack = -1;
 static const float kFpEyeUp = 9.0f, kFpEyeFwd = 8.0f;   // eyes from the head joint, game units
 static bool FpHeadFrame(const float* S, float* J, float* U, float* F) {   // S = 3 rows of 4: world = A q + T
     const float cy = sqrtf(S[1] * S[1] + S[5] * S[5] + S[9] * S[9]), cz = sqrtf(S[2] * S[2] + S[6] * S[6] + S[10] * S[10]);
@@ -633,6 +635,7 @@ static void MmUnlock(IDirect3DTexture9* t) {
         }
         if (g_fpWantBones && m.bits && m.w == 1024 && m.h == 64 && m.bpp == 16 && m.rc.top == 0 && m.rc.left == 0 && m.rc.right >= 48 && m.rc.bottom >= 1) {
             memcpy(g_plBone, m.bits, sizeof g_plBone); memcpy(g_plBoneRoot, g_fpRoot, 12); g_plBoneSeq = g_camSeq;
+            if (m.pitch == 16384) { const int rows = m.rc.bottom < 16 ? (int)m.rc.bottom : 16; memcpy(g_boneTex, m.bits, (size_t)rows * 16384); g_boneTexOk = true; }
         }
         if (g_fpProbe && m.bits && m.rc.left >= 0 && m.rc.top >= 0 && m.rc.right <= (LONG)m.w && m.rc.bottom <= (LONG)m.h)
             for (LONG y = m.rc.top; y < m.rc.bottom; y++)
@@ -668,14 +671,35 @@ static void FpProbeDraw(IDirect3DDevice9* d, UINT prims, UINT verts) {
 }
 // build 111: first person - the player's own skinned meshes (skeleton slot 0,0 of the bone texture; not the shadow passes) are
 // drawn with a clip plane that removes everything within FpHide of the eye plane: the head goes, the body stays when looking down
-static volatile bool g_fpHideOn; static volatile long g_fpClipped;
+static volatile bool g_fpHideOn; static volatile long g_fpClipped, g_fpClippedEq;
 static HRESULT FpSetRS(IDirect3DDevice9* d, D3DRENDERSTATETYPE st, DWORD v);
 static float g_fpPlB[2][4];
 static int FpClipPre(IDirect3DDevice9* d) {
     const FpVsInfo* v = FpVs(g_curVS);
     if (!v || v->samp < 0 || v->shadow || v->skinReg < 0 || v->skinReg >= 64) return 0;
     const float* sk = g_vsLow[v->skinReg];
-    if (sk[1] != 0.0f || sk[2] != 0.0f || sk[0] <= 0.0f) return 0;
+    if (sk[0] <= 0.0f) return 0;
+    if (sk[1] != 0.0f || sk[2] != 0.0f) {
+        // build 119: another skeleton. Equipment carried by the player (bow, quiver, shield, sheathed weapons: small models,
+        // bone scale under 200 where characters have 240 and more, sitting on the player) is not drawn behind the chest's back
+        // plane - so it is hidden while on the back and shows once it is in the hands.
+        if (g_fpHideBack < 0) g_fpHideBack = GetPrivateProfileIntW(L"VR", L"FpHideBack", 1, g_ini);
+        if (!g_fpHideBack || !g_fpQok || !g_boneTexOk) return 0;
+        const int tx = (int)(sk[1] * 1024.0f + 0.5f), ty = (int)(sk[2] * 64.0f + 0.5f);
+        if (tx < 0 || tx > 1021 || ty < 0 || ty > 15) return 0;
+        const float* S = g_boneTex[ty][tx];   // bone 0: three texels = three rows
+        const float scl = sqrtf(S[0] * S[0] + S[4] * S[4] + S[8] * S[8]);
+        if (!(scl > 1.0f && scl < 200.0f)) return 0;
+        const float dx = S[3] - g_fpRoot[0], dy = S[7] - g_fpRoot[1], dz = S[11] - g_fpRoot[2];
+        if (dx * dx + dz * dz > 150.f * 150.f || dy < -60 || dy > 280) return 0;
+        float J[3], U[3], F[3]; if (!FpHeadFrame(g_plBone[15], J, U, F)) return 0;
+        const float* C = g_plBone[13]; float cf[3] = { C[2], C[6], C[10] }; const float cl = sqrtf(cf[0] * cf[0] + cf[1] * cf[1] + cf[2] * cf[2]);   // chest forward
+        if (cl > 20) { cf[0] /= cl; cf[1] /= cl; cf[2] /= cl; } else memcpy(cf, F, 12);
+        const float w[4] = { cf[0], cf[1], cf[2], -(cf[0] * J[0] + cf[1] * J[1] + cf[2] * J[2]) + 6.0f }; float cp[4];
+        if (!dxr::WorldPlaneToClip(w, cp)) return 0;
+        d->SetClipPlane(0, cp); FpSetRS(d, D3DRS_CLIPPLANEENABLE, D3DCLIPPLANE0); InterlockedIncrement(&g_fpClippedEq);
+        return 1;
+    }
     float J[3], U[3], F[3];
     if (g_fpQok && FpHeadFrame(g_plBone[15], J, U, F)) {
         static long mSeq = -1; const long bs = g_plBoneSeq;
@@ -1860,40 +1884,60 @@ static void FpFindTarget(void* cam, const float* V, const float* P) {
                     }
                 }
                 if (!ok) dxr::SetFpEye(nullptr, false);
-                if (ok && dxr::FirstPerson()) {   // build 118: the body turns with the view while standing (FpTurnBody)
-                    // The character's rotation is expected as a quaternion at +0x50 (after the position at +0x40). It is used only
-                    // after it has agreed with the drawn skeleton's facing (bone 0) over a spread of directions.
+                if (ok && dxr::FirstPerson()) {   // build 119: the body turns with the view while standing (FpTurnBody)
+                    // 118 wrote the rotation quaternion at +0x50; the game put it back every frame (it keeps the heading elsewhere).
+                    // So: every float in the character object that tracks the skeleton's heading (as an angle, either sign, any
+                    // quarter-turn offset) and every quaternion that does are found while the player moves about, and all of them
+                    // are written together.
                     static int turn = -1; if (turn < 0) turn = GetPrivateProfileIntW(L"VR", L"FpTurnBody", 1, g_ini);
-                    static int agree, differ, stillN, wrote, verified; static float psi0; static bool have0, spread; static DWORD lastTl; static float lastErr = -1; static long seqSeen = -1;
-                    static float wantPsi; static int sinceWrite = -1;
+                    enum { NF = 0x1800 / 4 }; static uint8_t am[NF], qm[NF]; static int nS, state; static float lastPsi = 99, psiMin, psiAcc; static long seqSeen = -1;
+                    struct YF { int off, conv; }; static YF yf[24]; static int nYf; static int qf2[12]; static int nQf;
+                    static int stillN, wrote, wroteTot, noEff; static DWORD lastTl; static float lastErr = -1, wantPsi; static int sinceWrite = -1;
+                    auto wrap = [](float a) { while (a > 3.14159265f) a -= 6.2831853f; while (a < -3.14159265f) a += 6.2831853f; return a; };
+                    static const float kC[4] = { 0, 1.5707963f, 3.14159265f, -1.5707963f };
                     const float* S0 = g_plBone[0]; float bf[2] = { S0[2], S0[10] }; const float bl = sqrtf(bf[0] * bf[0] + bf[1] * bf[1]);
-                    float* qd = (float*)(u + 0x50);
-                    if (turn && bl > 20 && g_plBoneSeq >= 0 && g_camSeq - g_plBoneSeq <= 2 && Readable(u + 0x50, 16)) {
-                        bf[0] /= bl; bf[1] /= bl; const float psiB = atan2f(bf[0], bf[1]);
-                        const float qn = qd[0] * qd[0] + qd[1] * qd[1] + qd[2] * qd[2] + qd[3] * qd[3];
-                        const float qf[2] = { 2 * (qd[0] * qd[2] + qd[3] * qd[1]), 1 - 2 * (qd[0] * qd[0] + qd[1] * qd[1]) };   // (0,0,1) turned by q
-                        const bool unit = fabsf(qn - 1) < 0.02f; const float dot = qf[0] * bf[0] + qf[1] * bf[1];
-                        if (verified == 0 && g_plBoneSeq != seqSeen) { seqSeen = g_plBoneSeq;
-                            if (unit && dot > 0.96f) { agree++; if (!have0) { have0 = true; psi0 = psiB; } float dd = psiB - psi0; while (dd > 3.14159f) dd -= 6.28319f; while (dd < -3.14159f) dd += 6.28319f; if (fabsf(dd) > 1.0f) spread = true; }
-                            else if (++differ == 200 && agree < 20) { verified = -1; Log("fp: body turning not available - the value at character +0x50 is not its rotation (%.3f %.3f %.3f %.3f, skeleton faces %.2f rad)", qd[0], qd[1], qd[2], qd[3], psiB); }
-                            if (agree >= 60 && spread && agree > differ * 4) { verified = 1; Log("fp: character rotation confirmed at +0x50 (%d frames agree, %d differ) - the body turns with the view while standing", agree, differ); }
+                    if (turn && bl > 20 && g_plBoneSeq >= 0 && g_camSeq - g_plBoneSeq <= 2) {
+                        const float psiB = atan2f(bf[0], bf[1]);
+                        if (state == 0 && g_plBoneSeq != seqSeen && fabsf(wrap(psiB - lastPsi)) > 0.12f && Readable(u, 0x1800)) {
+                            seqSeen = g_plBoneSeq; const float* fl = (const float*)u;
+                            if (nS == 0) { memset(am, 0xFF, sizeof am); memset(qm, 1, sizeof qm); psiAcc = 0; }
+                            else psiAcc += fabsf(wrap(psiB - lastPsi));
+                            lastPsi = psiB; nS++;
+                            for (int i = 0; i < NF; i++) {
+                                if (am[i]) { const float f = fl[i]; if (!(f > -7.0f && f < 7.0f)) am[i] = 0; else for (int k = 0; k < 8; k++) if ((am[i] >> k) & 1) { const float pr = (k & 4 ? -f : f) + kC[k & 3]; if (fabsf(wrap(pr - psiB)) > 0.04f) am[i] &= ~(1 << k); } }
+                                if (qm[i] && i + 4 <= NF) { const float* q = fl + i; const float qn = q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3];
+                                    const float fx = 2 * (q[0] * q[2] + q[3] * q[1]), fz = 1 - 2 * (q[0] * q[0] + q[1] * q[1]);
+                                    if (fabsf(qn - 1) > 0.02f || fx * bf[0] / bl + fz * bf[1] / bl < 0.97f) qm[i] = 0; } else qm[i] = 0;
+                            }
+                            if (nS >= 40 && psiAcc > 6.0f) {
+                                nYf = nQf = 0; char b2[700]; int n2 = 0; b2[0] = 0;
+                                for (int i = 0; i < NF; i++) if (am[i] && nYf < 24) { int k = 0; while (!((am[i] >> k) & 1)) k++; yf[nYf++] = { i * 4, k }; n2 += snprintf(b2 + n2, sizeof b2 - n2, " +0x%x(%s%s)", i * 4, k & 4 ? "-" : "", (k & 3) == 0 ? "a" : (k & 3) == 1 ? "a+90" : (k & 3) == 2 ? "a+180" : "a-90"); }
+                                n2 += snprintf(b2 + n2, sizeof b2 - n2, " | quaternions:");
+                                for (int i = 0; i < NF; i++) if (qm[i] && nQf < 12) { qf2[nQf++] = i * 4; n2 += snprintf(b2 + n2, sizeof b2 - n2, " +0x%x", i * 4); }
+                                state = (nYf || nQf) ? 1 : -1;
+                                Log("fp: body turn - heading fields in the character object after %d samples: angles:%s%s", nS, b2, state == 1 ? "" : " - none, body turning not available");
+                            }
                         }
                         const float mvv = fabsf(vstep2[0]) + fabsf(vstep2[1]) + fabsf(vstep2[2]);
                         stillN = mvv < 0.05f ? stillN + 1 : 0;
                         float lx, lz;
-                        if (verified == 1 && unit && stillN >= 12 && dxr::FpLookDir(&lx, &lz)) {
-                            const float psiV = atan2f(lx, lz), psiQ = atan2f(qf[0], qf[1]); float dd = psiV - psiQ; while (dd > 3.14159f) dd -= 6.28319f; while (dd < -3.14159f) dd += 6.28319f;
+                        if (state == 1 && stillN >= 12 && dxr::FpLookDir(&lx, &lz) && Readable(u, 0x1800)) {
+                            const float dd = wrap(atan2f(lx, lz) - psiB);
                             if (fabsf(dd) > 0.12f) {   // 7 degrees of slack; then follow at up to 8 rad/s
-                                const float stepMax = 8.0f / 60.0f; const float st = dd > stepMax ? stepMax : dd < -stepMax ? -stepMax : dd; const float np = psiQ + st;
-                                qd[0] = 0; qd[1] = sinf(np * 0.5f); qd[2] = 0; qd[3] = cosf(np * 0.5f); wrote++; wantPsi = np; sinceWrite = 0;
-                            }
+                                const float stepMax = 8.0f / 60.0f; const float np = psiB + (dd > stepMax ? stepMax : dd < -stepMax ? -stepMax : dd);
+                                float* fl = (float*)u;
+                                for (int i = 0; i < nYf; i++) { float& f = fl[yf[i].off / 4]; float t = np - kC[yf[i].conv & 3]; if (yf[i].conv & 4) t = -t; f += wrap(t - f); }   // nearest equivalent angle
+                                for (int i = 0; i < nQf; i++) { float* q = fl + qf2[i] / 4; q[0] = 0; q[1] = sinf(np * 0.5f); q[2] = 0; q[3] = cosf(np * 0.5f); }
+                                wrote++; wroteTot++; wantPsi = np; if (sinceWrite < 0) sinceWrite = 0;
+                                if (++noEff == 240) { state = -2; Log("fp: body turn - the game does not take the written heading (4 s of writing without reaching the view direction); switched off"); }
+                            } else noEff = 0;
                         }
-                        if (sinceWrite >= 0 && ++sinceWrite == 4) { float dd = psiB - wantPsi; while (dd > 3.14159f) dd -= 6.28319f; while (dd < -3.14159f) dd += 6.28319f; lastErr = fabsf(dd); sinceWrite = -1; }
-                        if (nowT - lastTl > 10000 && (wrote || verified == 0)) { lastTl = nowT; Log("fp: body turn - rotation check %s (%d agree / %d differ, spread %d), %d writes in 10 s, skeleton 3 frames after a write is %.2f rad from the written direction", verified == 1 ? "passed" : verified < 0 ? "failed" : "running", agree, differ, (int)spread, wrote, lastErr); wrote = 0; }
+                        if (sinceWrite >= 0 && ++sinceWrite == 6) { lastErr = fabsf(wrap(psiB - wantPsi)); sinceWrite = -1; }
+                        if (nowT - lastTl > 10000) { lastTl = nowT; Log("fp: body turn - state %d (%d samples, %.1f rad turned), %d writes in 10 s, skeleton after a write %.2f rad from the written direction", state, nS, psiAcc, wrote, lastErr); wrote = 0; }
                     }
                 }
                 g_fpHideOn = ok && dxr::FirstPerson(); g_fpWantBones = g_fpHideOn; g_fpRootOk = ok; InterlockedIncrement(&g_camSeq);
-                { static DWORD lastC; if (g_fpHideOn && nowT - lastC > 10000) { lastC = nowT; Log("fp: own-body clip plane used on %ld draws in the last 10 s", InterlockedExchange(&g_fpClipped, 0)); } }
+                { static DWORD lastC; if (g_fpHideOn && nowT - lastC > 10000) { lastC = nowT; Log("fp: own-body cut used on %ld draws, carried-equipment cut on %ld draws in the last 10 s", InterlockedExchange(&g_fpClipped, 0), InterlockedExchange(&g_fpClippedEq, 0)); } }
                 if ((int)ok != state) { state = ok; Log("fp: %s (camera class %p, distance %.0f)", ok ? "character found under the camera target - first person available" : "no character under the camera target - first person paused", *(void* const*)o, dist); }
             }
             memcpy(g_fpTarget, tv, 12); memcpy(g_fpCam, cp, 12); g_fpHave = true;
