@@ -559,6 +559,9 @@ struct FpVsInfo { IDirect3DVertexShader9* vs; int skinReg, invReg, samp, shadow;
 static FpVsInfo g_fpVsI[256]; static int g_fpVsN; static int g_fpDraws, g_fpLogged;
 struct MmTex { IDirect3DTexture9* t; UINT w, h; int fmt, bpp; std::vector<uint8_t> shadow; void* bits; int pitch; RECT rc; bool locked; int locks; };
 static MmTex g_mm[6]; static int g_mmN; static CRITICAL_SECTION g_mmCs; static bool g_mmCsInit;
+// build 112: per-frame record of the player's skeleton (first 120 bones of slot 0,0) with the character position, while measuring
+static HANDLE g_boneFile = INVALID_HANDLE_VALUE; static volatile bool g_boneRec; static volatile long g_camSeq; static long g_boneN;
+static float g_fpRoot[3], g_fpEyeDbg[3]; static volatile bool g_fpRootOk;
 static const FpVsInfo* FpVs(IDirect3DVertexShader9* vs) {
     for (int i = 0; i < g_fpVsN; i++) if (g_fpVsI[i].vs == vs) return &g_fpVsI[i];
     if (!vs || g_fpVsN >= 256) return nullptr;
@@ -602,7 +605,7 @@ static void MmLock(IDirect3DTexture9* t, D3DLOCKED_RECT* lr, const RECT* rc, DWO
         }
     }
     if (m) { m->bits = lr->pBits; m->pitch = lr->Pitch; m->locked = true; if (rc) m->rc = *rc; else m->rc = { 0, 0, (LONG)m->w, (LONG)m->h };
-        if (m->locks++ < 6) Log("probe: lock %p rect %ld,%ld-%ld,%ld flags 0x%lx pitch %d (replay %d)", t, m->rc.left, m->rc.top, m->rc.right, m->rc.bottom, fl, lr->Pitch, (int)g_replay); }
+        if (m->locks++ < 3) Log("probe: lock %p rect %ld,%ld-%ld,%ld flags 0x%lx pitch %d (replay %d)", t, m->rc.left, m->rc.top, m->rc.right, m->rc.bottom, fl, lr->Pitch, (int)g_replay); }
     LeaveCriticalSection(&g_mmCs);
 }
 static void MmUnlock(IDirect3DTexture9* t) {
@@ -610,6 +613,11 @@ static void MmUnlock(IDirect3DTexture9* t) {
     EnterCriticalSection(&g_mmCs);
     for (int i = 0; i < g_mmN; i++) { MmTex& m = g_mm[i]; if (m.t != t || !m.locked) continue;
         m.locked = false;
+        if (g_boneRec && g_boneFile != INVALID_HANDLE_VALUE && m.bits && m.w == 1024 && m.h == 64 && m.bpp == 16 && m.rc.top == 0 && m.rc.left == 0 && m.rc.right >= 360 && m.rc.bottom >= 1) {
+            struct { DWORD tick; long seq; float root[3], tgt[3], cam[3], eye[3]; float ok; } h;
+            h.tick = GetTickCount(); h.seq = g_camSeq; memcpy(h.root, g_fpRoot, 12); memcpy(h.tgt, g_fpTarget, 12); memcpy(h.cam, g_fpCam, 12); memcpy(h.eye, g_fpEyeDbg, 12); h.ok = g_fpRootOk ? 1.0f : 0.0f;
+            DWORD wr; WriteFile(g_boneFile, &h, sizeof h, &wr, nullptr); WriteFile(g_boneFile, m.bits, 360 * 16, &wr, nullptr); g_boneN++;
+        }
         if (m.bits && m.rc.left >= 0 && m.rc.top >= 0 && m.rc.right <= (LONG)m.w && m.rc.bottom <= (LONG)m.h)
             for (LONG y = m.rc.top; y < m.rc.bottom; y++)
                 memcpy(&m.shadow[((size_t)y * m.w + m.rc.left) * m.bpp], (const uint8_t*)m.bits + (size_t)(y - m.rc.top) * m.pitch, (size_t)(m.rc.right - m.rc.left) * m.bpp);
@@ -644,7 +652,7 @@ static void FpProbeDraw(IDirect3DDevice9* d, UINT prims, UINT verts) {
 }
 // build 111: first person - the player's own skinned meshes (skeleton slot 0,0 of the bone texture; not the shadow passes) are
 // drawn with a clip plane that removes everything within FpHide of the eye plane: the head goes, the body stays when looking down
-static volatile bool g_fpHideOn; static long g_fpClipped;
+static volatile bool g_fpHideOn; static volatile long g_fpClipped;
 static HRESULT FpSetRS(IDirect3DDevice9* d, D3DRENDERSTATETYPE st, DWORD v);
 static bool FpClipPre(IDirect3DDevice9* d) {
     const FpVsInfo* v = FpVs(g_curVS);
@@ -652,7 +660,7 @@ static bool FpClipPre(IDirect3DDevice9* d) {
     const float* sk = g_vsLow[v->skinReg];
     if (sk[1] != 0.0f || sk[2] != 0.0f || sk[0] <= 0.0f) return false;
     float pl[4]; if (!dxr::FpClipPlane(pl)) return false;
-    d->SetClipPlane(0, pl); FpSetRS(d, D3DRS_CLIPPLANEENABLE, D3DCLIPPLANE0); g_fpClipped++;
+    d->SetClipPlane(0, pl); FpSetRS(d, D3DRS_CLIPPLANEENABLE, D3DCLIPPLANE0); InterlockedIncrement(&g_fpClipped);
     return true;
 }
 static IDirect3DBaseTexture9* g_curTex[8];
@@ -1708,6 +1716,28 @@ static void FullRectTick() {
 // near it that lies straight ahead of the camera. The target (the point the third-person camera orbits, at the
 // character) becomes the first-person eye point.
 static bool FpVec(const uint8_t* o, int off, float* v) { memcpy(v, o + off, 12); for (int k = 0; k < 3; k++) if (!(v[k] == v[k]) || fabsf(v[k]) > 1e7f) return false; return true; }
+// build 112 (measurement): every object in memory that looks like a character - a class pointer inside the game's image, a
+// position at +0x40 and the same position raised by 20..200 at +0x1c0 (the pattern the player's object shows)
+static void ChrScan(const float* root, const void* player) {
+    uint8_t* base = (uint8_t*)GetModuleHandleW(nullptr); auto* nt = (IMAGE_NT_HEADERS*)(base + ((IMAGE_DOS_HEADER*)base)->e_lfanew);
+    const uintptr_t lo = (uintptr_t)base, hi = lo + nt->OptionalHeader.SizeOfImage; const DWORD t0 = GetTickCount(); int n = 0; size_t bytes = 0;
+    MEMORY_BASIC_INFORMATION mbi; uintptr_t a = 0x10000;
+    while (a < 0x7FFE0000u && VirtualQuery((void*)a, &mbi, sizeof mbi)) {
+        uintptr_t rb = (uintptr_t)mbi.BaseAddress, re = rb + mbi.RegionSize;
+        if (mbi.State == MEM_COMMIT && mbi.Protect == PAGE_READWRITE && mbi.Type == MEM_PRIVATE && mbi.RegionSize >= 0x1000) {
+            bytes += mbi.RegionSize;
+            for (uintptr_t q = (rb + 15) & ~(uintptr_t)15; q + 0x1d0 <= re; q += 16) {
+                uintptr_t vt = *(const uintptr_t*)q; if (vt < lo || vt >= hi || (vt & 3)) continue;
+                const float* p = (const float*)(q + 0x40); const float* r = (const float*)(q + 0x1c0);
+                if (!(fabsf(p[0] - root[0]) < 4000 && fabsf(p[1] - root[1]) < 1500 && fabsf(p[2] - root[2]) < 4000)) continue;
+                if (!(fabsf(r[0] - p[0]) < 1.0f && fabsf(r[2] - p[2]) < 1.0f && r[1] - p[1] > 20 && r[1] - p[1] < 200)) continue;
+                if (n++ < 120) Log("chr: %p class %p pos %.1f %.1f %.1f (+%.0f)%s", (void*)q, (void*)vt, p[0], p[1], p[2], r[1] - p[1], (const void*)q == player ? " = player" : "");
+            }
+        }
+        if (re <= a) break; a = re;
+    }
+    Log("chr: %d objects, %u MB scanned in %lu ms", n, (unsigned)(bytes >> 20), GetTickCount() - t0);
+}
 static void FpFindTarget(void* cam, const float* V, const float* P) {
     bool row = fabsf(fabsf(P[11]) - 1) < 1e-3f && fabsf(P[15]) < 1e-3f, col = fabsf(fabsf(P[14]) - 1) < 1e-3f && fabsf(P[15]) < 1e-3f;
     if (!row && !col) { dxr::SetFpEye(nullptr, false); return; }
@@ -1740,11 +1770,13 @@ static void FpFindTarget(void* cam, const float* V, const float* P) {
                         if (h < 60 || nowT - lastT > 2000) h = dy; else if (mv < 0.5f) h += (dy - h) * 0.05f;
                         memcpy(lastRoot, rp, 12); lastT = nowT;
                         float eye[3] = { rp[0], rp[1] + h, rp[2] };
+                        memcpy(g_fpRoot, rp, 12); memcpy(g_fpEyeDbg, eye, 12);
                         dxr::SetFpEye(eye, true);
                     }
                 }
                 if (!ok) dxr::SetFpEye(nullptr, false);
-                g_fpHideOn = ok && dxr::FirstPerson();
+                g_fpHideOn = ok && dxr::FirstPerson(); g_fpRootOk = ok; InterlockedIncrement(&g_camSeq);
+                { static DWORD lastC; if (g_fpHideOn && nowT - lastC > 10000) { lastC = nowT; Log("fp: own-body clip plane used on %ld draws in the last 10 s", InterlockedExchange(&g_fpClipped, 0)); } }
                 if ((int)ok != state) { state = ok; Log("fp: %s (camera class %p, distance %.0f)", ok ? "character found under the camera target - first person available" : "no character under the camera target - first person paused", *(void* const*)o, dist); }
             }
             memcpy(g_fpTarget, tv, 12); memcpy(g_fpCam, cp, 12); g_fpHave = true;
@@ -1757,6 +1789,9 @@ static void FpFindTarget(void* cam, const float* V, const float* P) {
                     g_fpMeasureN++; g_fpMeasureUntil = nowT + 20000; g_fpProbe = 1; g_wlogLines = 0; g_wlog = true; nCand = 0; was = true;
                     Log("measure %d: started (20 s) - camera class %p, distance %.0f, first person %d", g_fpMeasureN, *(void* const*)o, dist, (int)dxr::FirstPerson());
                     dxr::ShowMessage(L"Measuring for 20 seconds...", 3.0);
+                    if (g_fpRootOk) ChrScan(g_fpRoot, *(const void* const*)(o + 0x70));
+                    {   wchar_t path[MAX_PATH]; wcscpy(path, g_ini); wchar_t* sl = wcsrchr(path, L'\\'); swprintf(sl ? sl + 1 : path, 64, L"ddda_bones_%d.bin", g_fpMeasureN);
+                        EnterCriticalSection(&g_mmCs); g_boneFile = CreateFileW(path, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, 0, nullptr); g_boneN = 0; g_boneRec = true; LeaveCriticalSection(&g_mmCs); }
                     // candidates: vectors in the camera object, and in objects it points to, that sit near the target (or under it)
                     for (int po = -4; po < 0x800 && nCand < 72; po += 4) {
                         const uint8_t* u = po < 0 ? o : *(const uint8_t* const*)(o + po);
@@ -1775,7 +1810,7 @@ static void FpFindTarget(void* cam, const float* V, const float* P) {
                 }
                 endP = endK;
                 if (g_fpMeasureUntil && nowT - lastSample >= 250) {
-                    lastSample = nowT; char b[1000]; int n = snprintf(b, sizeof b, "msr %lu cam %.1f %.1f %.1f tgt %.1f %.1f %.1f |", nowT, cp[0], cp[1], cp[2], tv[0], tv[1], tv[2]);
+                    lastSample = nowT; char b[1000]; int n = snprintf(b, sizeof b, "msr %lu fp %d cam %.1f %.1f %.1f tgt %.1f %.1f %.1f root %.1f %.1f %.1f |", nowT, (int)dxr::FirstPerson(), cp[0], cp[1], cp[2], tv[0], tv[1], tv[2], g_fpRoot[0], g_fpRoot[1], g_fpRoot[2]);
                     for (int k = 0; k < nCand; k++) {
                         const uint8_t* u = cand[k].ptr < 0 ? o : *(const uint8_t* const*)(o + cand[k].ptr); float pp[3];
                         if (u && !((uintptr_t)u & 3) && Readable(u, 0x800) && FpVec(u, cand[k].off, pp)) n += snprintf(b + n, sizeof b - n, " %d:%.0f,%.0f,%.0f", k, pp[0] - tv[0], pp[1] - tv[1], pp[2] - tv[2]);
@@ -1783,7 +1818,10 @@ static void FpFindTarget(void* cam, const float* V, const float* P) {
                     }
                     Log("%s", b);
                 }
-                if (g_fpMeasureUntil && (LONG)(nowT - g_fpMeasureUntil) >= 0) { g_fpMeasureUntil = 0; g_wlog = false; Log("measure %d: done", g_fpMeasureN); dxr::ShowMessage(L"Measurement done", 3.0); }
+                if (g_fpMeasureUntil && (LONG)(nowT - g_fpMeasureUntil) >= 0) { g_fpMeasureUntil = 0; g_wlog = false;
+                    EnterCriticalSection(&g_mmCs); g_boneRec = false; if (g_boneFile != INVALID_HANDLE_VALUE) { CloseHandle(g_boneFile); g_boneFile = INVALID_HANDLE_VALUE; } LeaveCriticalSection(&g_mmCs);
+                    if (g_fpRootOk) ChrScan(g_fpRoot, *(const void* const*)(o + 0x70));
+                    Log("measure %d: done - %ld skeleton frames recorded", g_fpMeasureN, g_boneN); dxr::ShowMessage(L"Measurement done", 3.0); }
                 (void)was;
             }
             void* vt = *(void* const*)o;
@@ -2013,7 +2051,7 @@ static void VigWrite(VigCand& c, bool clear) {
 }
 static HRESULT STDMETHODCALLTYPE hkTexLock(IDirect3DTexture9* t, UINT lv, D3DLOCKED_RECT* lr, const RECT* rc, DWORD fl) {
     HRESULT hr = oTexLock(t, lv, lr, rc, fl);
-    if (g_fpProbe && SUCCEEDED(hr) && lv == 0 && lr && !(fl & D3DLOCK_READONLY)) MmLock(t, lr, rc, fl);   // build 110
+    if ((g_fpProbe || g_boneRec) && SUCCEEDED(hr) && lv == 0 && lr && !(fl & D3DLOCK_READONLY)) MmLock(t, lr, rc, fl);   // build 110
     if (SUCCEEDED(hr) && lv == 0 && !rc && lr && !(fl & D3DLOCK_READONLY)) {
         EnterCriticalSection(&g_vigCs);
         if (VigCand* c = VigFind(t)) { c->bits = lr->pBits; c->pitch = lr->Pitch; }
