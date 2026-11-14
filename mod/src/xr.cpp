@@ -296,7 +296,7 @@ static int g_track = 1, g_headPos = 1, g_lag = 0; static float g_scale = 100.0f;
 static bool g_frameOpen; static XrFrameState g_fs{ XR_TYPE_FRAME_STATE };
 static Q g_refYaw{ 0, 0, 0, 1 }; static float g_refPos[3]; static bool g_refSet, g_wantRef;
 static long g_camCalls, g_camApplied;
-static int g_fp, g_autoRecenter = 1; static float g_fpUp, g_fpFwd = 0.0f, g_fpHide = 0.22f, g_fpBarPush = 65.0f, g_fpBarLift = 12.0f, g_fpEye[3]; static volatile bool g_fpEyeValid, g_fpActive, g_fpLookOk; static float g_fpLook[2];   // build 108
+static int g_fp, g_autoRecenter = 1; static float g_fpUp, g_fpFwd = 0.0f, g_fpHide = 0.22f, g_fpBarPush = 65.0f, g_fpBarLift = 12.0f, g_fpRetDist = 3000.0f, g_fpEye[3]; static volatile bool g_fpEyeValid, g_fpActive, g_fpLookOk; static float g_fpLook[2];   // build 108
 
 void ConfigureTracking(const wchar_t* ini) {
     g_track = GetPrivateProfileIntW(L"VR", L"HeadTracking", 1, ini);
@@ -313,7 +313,8 @@ void ConfigureTracking(const wchar_t* ini) {
       GetPrivateProfileStringW(L"VR", L"FpForward", L"0.00", u, 32, ini); g_fpFwd = (float)_wtof(u);
       GetPrivateProfileStringW(L"VR", L"FpHide", L"0.22", u, 32, ini); g_fpHide = (float)_wtof(u);
       GetPrivateProfileStringW(L"VR", L"FpBarPush", L"65", u, 32, ini); g_fpBarPush = (float)_wtof(u);
-      GetPrivateProfileStringW(L"VR", L"FpBarLift", L"12", u, 32, ini); g_fpBarLift = (float)_wtof(u); }
+      GetPrivateProfileStringW(L"VR", L"FpBarLift", L"12", u, 32, ini); g_fpBarLift = (float)_wtof(u);
+      GetPrivateProfileStringW(L"VR", L"FpReticleDist", L"3000", u, 32, ini); g_fpRetDist = (float)_wtof(u); if (g_fpRetDist < 100) g_fpRetDist = 100; }
     g_autoRecenter = GetPrivateProfileIntW(L"VR", L"AutoRecenter", 1, ini);
     Log("xr: FirstPerson=%d (F2 switches; eye %.2f m up, %.2f m forward of the character's head position; own body hidden within %.2f m) AutoRecenter=%d", g_fp, g_fpUp, g_fpFwd, g_fpHide, g_autoRecenter);
 }
@@ -542,6 +543,11 @@ bool WorldGuiToEye(int mode, float x, float y, float z, float* X, float* Y, floa
     float t = fabsf(a) > 1e-4f ? (s * z - b) / a : z;
     if (t < 1.0f) t = z;
     float pe[4] = { r[0] * t, r[1] * t, r[2] * t, 1.0f };
+    if (mode & 0x200) {   // build 122: the aiming reticle in first person - a point far along the game camera's own axis (where
+        // the game shoots), seen from the first-person eye; the level first-person view does not carry the camera's pitch
+        if (!c.fp) return false;
+        const float D = g_fpRetDist; pe[0] = s * D * c.Mh[8] + c.Mh[12]; pe[1] = s * D * c.Mh[9] + c.Mh[13]; pe[2] = s * D * c.Mh[10] + c.Mh[14];
+    }
     if (c.fp && (mode & 0x100) && g_fpBarPush != 0) {
         // build 115: a pawn's / NPC's name and health bar is placed by the game about 65 units from the head towards its own camera
         // (measured against Rook's tracked head, first and third person: 54..68 along the game camera's ray, about 21 above the

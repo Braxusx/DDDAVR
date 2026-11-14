@@ -575,28 +575,42 @@ static float g_boneTex[16][1024][4]; static volatile bool g_boneTexOk; static in
 // position, by the angle between the skeleton's heading and the head's look direction. Nothing in the game's own objects changes.
 static uint16_t g_slotSeen[16 * 1024];   // per first texel of a skeleton: the camera frame it was last drawn with
 struct EqSlot { int idx; long seq; }; static EqSlot g_eqSlot[16]; static float g_plBone0Raw[12]; static int g_fpTurn = -1;
+// what was written, bone by bone, and what the game had there: a bone the game has not rewritten since is put back before
+// anything else (the game does not rewrite every bone every frame; 121 turned those again and again, and turned stale ones for good)
+struct TurnRec { int idx, n; float raw[96][12], wr[96][12]; }; static TurnRec g_turnRec[17]; volatile bool g_fpTurnDirty;
+struct ChrT { float x, y, z; }; static ChrT g_chrT[32]; static volatile int g_chrN;   // other characters' bone-0 places (scale 200+)
+static void FpTurnRestore(float* tex, int rows) {
+    const int lim = rows * 1024; bool any = false;
+    for (int k = 0; k < 17; k++) { TurnRec& r = g_turnRec[k];
+        for (int i = 0; i < r.n; i++) { if (r.idx + (i + 1) * 3 > lim) break; float* t = tex + (r.idx + i * 3) * 4; if (!memcmp(t, r.wr[i], 48)) memcpy(t, r.raw[i], 48); }
+        r.n = 0; }
+    (void)any; g_fpTurnDirty = false;
+}
 static void FpTurnSkeletons(float* tex, int rows) {
+    const long now = g_camSeq; const int lim = rows * 1024;
+    {   int n = 0;   // the characters drawn lately, for the "whose equipment" test
+        for (int idx = 3; idx + 3 <= lim && n < 32; idx += 3) { if ((uint16_t)((uint16_t)now - g_slotSeen[idx]) >= 4) continue; const float* S = tex + idx * 4;
+            const float sc = sqrtf(S[0] * S[0] + S[4] * S[4] + S[8] * S[8]); if (sc >= 200.0f && sc < 2000.0f) g_chrT[n++] = { S[3], S[7], S[11] }; }
+        g_chrN = n; }
     float lx, lz; if (!dxr::FpLookDir(&lx, &lz)) return;
     const float fx = tex[2], fz = tex[10], fl = sqrtf(fx * fx + fz * fz); if (!(fl > 20)) return;   // player bone 0, packed +z = forward
     float dd = atan2f(lx, lz) - atan2f(fx, fz); while (dd > 3.14159265f) dd -= 6.2831853f; while (dd < -3.14159265f) dd += 6.2831853f;
-    if (fabsf(dd) < 0.005f) return;
     const float c = cosf(dd), sn = sinf(dd), cx = g_fpRoot[0], cz = g_fpRoot[2];
-    struct Done { int idx; float m[12]; }; static Done done[17];
-    const long now = g_camSeq; const int lim = rows * 1024;
     for (int k = 0; k < 17; k++) {
         int idx, cap;
         if (k == 0) { idx = 0; cap = 96; }
-        else { const EqSlot& e = g_eqSlot[k - 1]; if (e.idx <= 0 || now - e.seq > 3) continue; idx = e.idx; cap = 48; }
+        else { const EqSlot& e = g_eqSlot[k - 1]; if (e.idx <= 0 || now - e.seq > 3) continue; idx = e.idx; cap = 24; }
         if (idx + 3 > lim) continue;
-        if (done[k].idx == idx && !memcmp(done[k].m, tex + idx * 4, 48)) continue;   // the game has not rewritten it: already turned
-        int n = 1; while (n < cap && idx + (n + 1) * 3 <= lim && (uint16_t)((uint16_t)now - g_slotSeen[idx + n * 3]) >= 4) n++;   // up to the next skeleton
+        int n = 1; while (n < cap && idx + (n + 1) * 3 <= lim && (uint16_t)((uint16_t)now - g_slotSeen[idx + n * 3]) >= 4) n++;   // up to the next skeleton drawn
         if (k == 0) { static int plN = 48; if (n < cap) plN = n; n = plN; if (idx + n * 3 > lim) continue; }   // the player: the count once seen, 48 until then
+        TurnRec& r = g_turnRec[k]; r.idx = idx; r.n = n;
         for (int i = 0; i < n; i++) {
-            float* r0 = tex + (idx + i * 3) * 4; float* r2 = r0 + 8;
+            float* r0 = tex + (idx + i * 3) * 4; float* r2 = r0 + 8; memcpy(r.raw[i], r0, 48);
             for (int j = 0; j < 3; j++) { const float a = r0[j], b = r2[j]; r0[j] = c * a + sn * b; r2[j] = -sn * a + c * b; }
             const float tx = r0[3] - cx, tz = r2[3] - cz; r0[3] = c * tx + sn * tz + cx; r2[3] = -sn * tx + c * tz + cz;
+            memcpy(r.wr[i], r0, 48);
         }
-        done[k].idx = idx; memcpy(done[k].m, tex + idx * 4, 48);
+        g_fpTurnDirty = true;
     }
 }
 static const float kFpEyeUp = 9.0f, kFpEyeFwd = 8.0f;   // eyes from the head joint, game units
@@ -662,6 +676,7 @@ static void MmUnlock(IDirect3DTexture9* t) {
             h.tick = GetTickCount(); h.seq = g_camSeq; memcpy(h.root, g_fpRoot, 12); memcpy(h.tgt, g_fpTarget, 12); memcpy(h.cam, g_fpCam, 12); memcpy(h.eye, g_fpEyeDbg, 12); h.ok = g_fpRootOk ? 1.0f : 0.0f;
             DWORD wr; WriteFile(g_boneFile, &h, sizeof h, &wr, nullptr); WriteFile(g_boneFile, m.bits, 4096 * 16, &wr, nullptr); g_boneN++;
         }
+        if (g_fpTurnDirty && m.bits && m.w == 1024 && m.h == 64 && m.bpp == 16 && m.rc.top == 0 && m.rc.left == 0 && m.rc.right >= 1024 && m.pitch == 16384) FpTurnRestore((float*)m.bits, m.rc.bottom < 16 ? (int)m.rc.bottom : 16);
         if (g_fpWantBones && m.bits && m.w == 1024 && m.h == 64 && m.bpp == 16 && m.rc.top == 0 && m.rc.left == 0 && m.rc.right >= 48 && m.rc.bottom >= 1) {
             memcpy(g_plBone0Raw, m.bits, 48);
             if (g_fpTurn < 0) g_fpTurn = GetPrivateProfileIntW(L"VR", L"FpTurnBody", 1, g_ini);
@@ -703,7 +718,7 @@ static void FpProbeDraw(IDirect3DDevice9* d, UINT prims, UINT verts) {
 }
 // build 111: first person - the player's own skinned meshes (skeleton slot 0,0 of the bone texture; not the shadow passes) are
 // drawn with a clip plane that removes everything within FpHide of the eye plane: the head goes, the body stays when looking down
-static volatile bool g_fpHideOn; static volatile long g_fpClipped, g_fpClippedEq;
+volatile bool g_fpHideOnX; static volatile bool& g_fpHideOn = g_fpHideOnX; static volatile long g_fpClipped, g_fpClippedEq;
 static HRESULT FpSetRS(IDirect3DDevice9* d, D3DRENDERSTATETYPE st, DWORD v);
 static float g_fpPlB[2][4];
 static int FpClipPre(IDirect3DDevice9* d) {
@@ -726,6 +741,9 @@ static int FpClipPre(IDirect3DDevice9* d) {
         if (!(scl > 1.0f && scl < 200.0f)) return 0;
         const float dx = S[3] - g_fpRoot[0], dy = S[7] - g_fpRoot[1], dz = S[11] - g_fpRoot[2];
         if (dx * dx + dz * dz > 150.f * 150.f || dy < -60 || dy > 280) return 0;
+        {   // build 122: not if another character is nearer to it than the player is (a pawn's weapon beside you)
+            const float* P0 = g_plBone[0]; const float px = S[3] - P0[3], pz = S[11] - P0[11]; const float dp = sqrtf(px * px + pz * pz);
+            const int nc = g_chrN; for (int i = 0; i < nc; i++) { const float ox = S[3] - g_chrT[i].x, oz = S[11] - g_chrT[i].z, oy = S[7] - g_chrT[i].y; if (fabsf(oy) < 300 && sqrtf(ox * ox + oz * oz) + 20.0f < dp) return 0; } }
         {   const int idx = ty * 1024 + tx; int slot = -1, old = 0; for (int i = 0; i < 16; i++) { if (g_eqSlot[i].idx == idx) { slot = i; break; } if (g_eqSlot[i].seq < g_eqSlot[old].seq) old = i; }
             if (slot < 0) { slot = old; g_eqSlot[slot].idx = idx; } g_eqSlot[slot].seq = g_camSeq; }
         if (!g_fpHideBack) return 0;
@@ -1499,7 +1517,7 @@ void NoteGuiVS(void* p, bool gui) {
 }
 static float g_subRaise = 190.0f, g_subDepth = 2.0f, g_dlgScale = 1.3f; static int g_reticle = 2;
 enum { TW_NONE = 0, TW_VS = 1, TW_RETICLE = 2, TW_WORLD = 8 };
-struct Tweak { int kind; float vs[11][4]; float ps[2][4]; bool rt, scEn, z; DWORD scOld, zOld; D3DVIEWPORT9 vp; };
+struct Tweak { int kind; float vs[11][4]; float ps[2][4]; bool rt, scEn, z, retW; DWORD scOld, zOld; D3DVIEWPORT9 vp; };
 static inline bool Eq(float a, float b) { return fabsf(a - b) < 0.01f; }
 // build 088/089: which GUI draws are world-anchored (089: decided by a fractional screen position, see IsWorldEl). HUD layers use whole-number depths (0, 16, 32, 230 seen: the 230 ones are HUD
 // pieces that 087 wrongly moved); a world element's depth is a measured distance. A depth within 0.01 of a whole number counts as
@@ -1553,13 +1571,24 @@ static int UiTweakPre(IDirect3DDevice9* d, Tweak& tw) {
             if (!dup && nSeen < 16) { memcpy(seen[nSeen++], c4, 12); lines++; dxr::WorldGuiLog(c4, g_wlogFrame, IsWorldEl(c4) ? 1 : 0); }
         }
     }
-    if (g_worldGui && g_replay >= 0 && g_uiScene && IsWorldEl(c4)) {
+    // build 122: in first person the bow / aiming reticle is drawn in the world too, far along the game camera's axis
+    extern volatile bool g_fpHideOnX; bool fpRet = false; tw.retW = false;
+    if (g_fpHideOnX && g_reticle && g_replay >= 0 && g_uiScene && Eq(c4[0], 640.0f) && Eq(c4[1], 360.0f) && c4[2] == 0.0f && dxr::GameViewZoomed()) {
+        IDirect3DBaseTexture9* bt = nullptr;
+        if (SUCCEEDED(d->GetTexture(0, &bt)) && bt) {
+            if (bt->GetType() == D3DRTYPE_TEXTURE) { D3DSURFACE_DESC td; if (SUCCEEDED(((IDirect3DTexture9*)bt)->GetLevelDesc(0, &td))) fpRet = td.Width == 512 && td.Height == 512; }
+            bt->Release();
+        }
+        if (fpRet && (FAILED(d->GetPixelShaderConstantF(4, tw.ps[0], 2)) || tw.ps[0][3] <= 0.0f)) fpRet = false;
+    }
+    if (g_replay >= 0 && g_uiScene && ((g_worldGui && IsWorldEl(c4)) || fpRet)) {
         float X, Y, k, rs = 0, rc = 1;
         // build 115: a name / health bar = several pieces at one depth (last frame's group at this place had an extent); a quest
         // marker is a single piece
         bool bar = false; for (int i = 0; i < g_gPrevN && !bar; i++) { const WGrp& g = g_gPrev[i];
             bar = fabsf(g.z - c4[2]) < 8.0f && c4[0] > g.x0 - 80.0f && c4[0] < g.x1 + 80.0f && c4[1] > g.y0 - 80.0f && c4[1] < g.y1 + 80.0f && (g.x1 - g.x0 > 4.0f || g.y1 - g.y0 > 4.0f); }
-        if (dxr::WorldGuiToEye(g_worldGui | (bar ? 0x100 : 0), c4[0], c4[1], c4[2], &X, &Y, &k, &rs, &rc)) {
+        if (fpRet) bar = false;
+        if (dxr::WorldGuiToEye(g_worldGui | (bar ? 0x100 : 0) | (fpRet ? 0x200 : 0), c4[0], c4[1], c4[2], &X, &Y, &k, &rs, &rc)) {
             memcpy(tw.vs[1], g_vsShadow[1], 32); memcpy(tw.vs[4], c4, 16); memcpy(tw.vs[10], c10, 16);
             k *= g_wmScale;
             float m[2][4]; memcpy(m, g_vsShadow[1], 32);
@@ -1583,6 +1612,7 @@ static int UiTweakPre(IDirect3DDevice9* d, Tweak& tw) {
             d->GetRenderState(D3DRS_SCISSORTESTENABLE, &tw.scOld); tw.scEn = tw.scOld != 0; if (tw.scEn) oSetRS(d, D3DRS_SCISSORTESTENABLE, FALSE);
             d->GetRenderState(D3DRS_ZENABLE, &tw.zOld); tw.z = tw.zOld != 0; if (tw.z) oSetRS(d, D3DRS_ZENABLE, FALSE);
             LOG_FIRST(1, "ui: world-anchored GUI drawn into the eye pictures (z %.0f -> %.0f,%.0f x%.2f)", c4[2], X, Y, k);
+            if (fpRet) { tw.retW = true; float pc[2][4] = { { 0, 0, 0, tw.ps[0][3] * 2.5f }, { 1, 1, 1, 0 } }; oPSC(d, 4, pc[0], 2); LOG_FIRST(1, "ui: first-person aiming reticle drawn in the world (-> %.0f,%.0f x%.2f)", X, Y, k); }
             tw.kind = TW_WORLD; return tw.kind;
         }
     }
@@ -1620,6 +1650,7 @@ static void UiTweakPost(IDirect3DDevice9* d, const Tweak& tw) {
     else if (tw.kind == (TW_VS | 4)) { oVSC(d, 1, tw.vs[1], 2); oVSC(d, 4, tw.vs[4], 1); }
     else if (tw.kind == TW_RETICLE) { oVSC(d, 4, tw.vs[4], 1); oPSC(d, 4, tw.ps[0], 2); }
     else if (tw.kind == TW_WORLD) {
+        if (tw.retW) oPSC(d, 4, tw.ps[0], 2);
         oVSC(d, 1, tw.vs[1], 2); oVSC(d, 4, tw.vs[4], 1); oVSC(d, 10, tw.vs[10], 1);
         if (tw.rt) { oSetRT(d, 0, g_uiSurf); oSetVP(d, &tw.vp); }
         if (tw.scEn) oSetRS(d, D3DRS_SCISSORTESTENABLE, tw.scOld);
@@ -2243,7 +2274,7 @@ static void VigWrite(VigCand& c, bool clear) {
 }
 static HRESULT STDMETHODCALLTYPE hkTexLock(IDirect3DTexture9* t, UINT lv, D3DLOCKED_RECT* lr, const RECT* rc, DWORD fl) {
     HRESULT hr = oTexLock(t, lv, lr, rc, fl);
-    if ((g_fpProbe || g_boneRec || g_fpWantBones) && SUCCEEDED(hr) && lv == 0 && lr && !(fl & D3DLOCK_READONLY)) MmLock(t, lr, rc, fl);   // build 110
+    if ((g_fpProbe || g_boneRec || g_fpWantBones || g_fpTurnDirty) && SUCCEEDED(hr) && lv == 0 && lr && !(fl & D3DLOCK_READONLY)) MmLock(t, lr, rc, fl);   // build 110
     if (SUCCEEDED(hr) && lv == 0 && !rc && lr && !(fl & D3DLOCK_READONLY)) {
         EnterCriticalSection(&g_vigCs);
         if (VigCand* c = VigFind(t)) { c->bits = lr->pBits; c->pitch = lr->Pitch; }
