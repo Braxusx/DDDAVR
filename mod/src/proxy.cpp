@@ -570,6 +570,9 @@ static float g_plBone[16][12]; static float g_plBoneRoot[3]; static volatile lon
 static float g_fpQj[3]; static volatile bool g_fpQok; static float g_fpLagD[3]; static volatile long g_fpLagN;
 // build 119: the first 16 rows of the bone texture as last written (every skeleton's bones), for the equipment test
 static float g_boneTex[16][1024][4]; static volatile bool g_boneTexOk; static int g_fpHideBack = -1;
+// build 124: the game cycles three bone textures (the render thread draws an older one while the game thread fills the next), so
+// the player's bones are kept per texture and the render side uses the copy that belongs to the texture actually bound
+struct TexBones { IDirect3DTexture9* t; float b[16][12]; long seq; }; static TexBones g_tb[4];
 // build 121: the drawn body turns with the view (FpTurnBody, visual only). Before the game unlocks the bone texture, the player's
 // bones and those of the equipment models sitting on the player are turned about the vertical axis through the character's
 // position, by the angle between the skeleton's heading and the head's look direction. Nothing in the game's own objects changes.
@@ -586,34 +589,63 @@ static void FpTurnRestore(float* tex, int rows) {
         r.n = 0; }
     (void)any; g_fpTurnDirty = false;
 }
-// build 123: whose equipment. 122 went by distance (and by which character was nearer), which took a pawn's gear for the player's
-// and dropped the player's own beside an NPC. Now a small model is the player's once it has kept its distance to the player's
-// bone 0 (within 60, under 170) while the player travelled 2.5 m - a pawn does not hold formation that tightly. It stays the
-// player's until it is more than 170 away for 20 frames. The body is only turned once the player has travelled that far.
-struct Trk { int idx; float ref, path; bool owned; int viol; long seq; }; static Trk g_trk[24]; static float g_trkRoot[3]; static float g_turnPath; static bool g_trkInit;
+// build 124: whose equipment. A worn or carried piece is driven by one of the player's joints, so one of its first bones stays in a
+// fixed relation to one of the player's bones (inverse(player bone) x piece bone is constant) while the player moves; nothing of
+// another character can do that. A piece is the player's once that has held over 60 units of the player's own movement; it is
+// re-tested when the relation breaks (drawn, sheathed) and dropped after 150 units of movement without one, or 170 away.
+// (123 went by a steady distance, which simulated or swinging pieces fail - they stayed unturned beside the turned body.)
+struct Trk { int idx; bool owned, refOk; int nb; uint64_t alive[4]; float ref[4][48][12]; float path, bad; int away; long seq; };
+static Trk g_trk[20]; static float g_trkRoot[3], g_trkPsi; static float g_turnPath; static bool g_trkInit;
 static void FpTurnSkeletons(float* tex, int rows) {
     const long now = g_camSeq; const int lim = rows * 1024;
-    float step = 0; if (g_trkInit) { const float a = g_fpRoot[0] - g_trkRoot[0], b = g_fpRoot[1] - g_trkRoot[1], c2 = g_fpRoot[2] - g_trkRoot[2]; step = sqrtf(a * a + b * b + c2 * c2); if (step > 60) step = 0; }
-    memcpy(g_trkRoot, g_fpRoot, 12); g_trkInit = true; g_turnPath += step;
+    const float psi = atan2f(tex[2], tex[10]);
+    float step = 0; if (g_trkInit) { const float a = g_fpRoot[0] - g_trkRoot[0], b = g_fpRoot[1] - g_trkRoot[1], c2 = g_fpRoot[2] - g_trkRoot[2]; step = sqrtf(a * a + b * b + c2 * c2); if (step > 60) step = 0;
+        float dp = psi - g_trkPsi; while (dp > 3.14159265f) dp -= 6.2831853f; while (dp < -3.14159265f) dp += 6.2831853f; step += 60.0f * fabsf(dp); }
+    memcpy(g_trkRoot, g_fpRoot, 12); g_trkPsi = psi; g_trkInit = true; g_turnPath += step;
     const float px = tex[3], py = tex[7], pz = tex[11];
-    for (int i = 0; i < 24; i++) if (g_trk[i].idx && now - g_trk[i].seq > 30) g_trk[i] = {};   // not drawn for half a second: forget
+    float inv[48][9]; bool invOk[48];   // the player's bones, inverted (linear part)
+    for (int b = 0; b < 48; b++) { const float* S = tex + b * 12;
+        const float m00 = S[0], m01 = S[1], m02 = S[2], m10 = S[4], m11 = S[5], m12 = S[6], m20 = S[8], m21 = S[9], m22 = S[10];
+        const float det = m00 * (m11 * m22 - m12 * m21) - m01 * (m10 * m22 - m12 * m20) + m02 * (m10 * m21 - m11 * m20);
+        invOk[b] = fabsf(det) > 1.0f; if (!invOk[b]) continue; const float id = 1.0f / det; float* I = inv[b];
+        I[0] = (m11 * m22 - m12 * m21) * id; I[1] = (m02 * m21 - m01 * m22) * id; I[2] = (m01 * m12 - m02 * m11) * id;
+        I[3] = (m12 * m20 - m10 * m22) * id; I[4] = (m00 * m22 - m02 * m20) * id; I[5] = (m02 * m10 - m00 * m12) * id;
+        I[6] = (m10 * m21 - m11 * m20) * id; I[7] = (m01 * m20 - m00 * m21) * id; I[8] = (m00 * m11 - m01 * m10) * id; }
+    for (int i = 0; i < 20; i++) if (g_trk[i].idx && now - g_trk[i].seq > 30) g_trk[i].idx = 0;   // not drawn for half a second: forget
     int nEq = 0; EqSlot eq[16];
     for (int idx = 3; idx + 3 <= lim; idx += 3) {
         if ((uint16_t)((uint16_t)now - g_slotSeen[idx]) >= 4) continue;
         const float* S = tex + idx * 4; const float sc = sqrtf(S[0] * S[0] + S[4] * S[4] + S[8] * S[8]);
         if (!(sc > 1.0f && sc < 200.0f)) continue;
         const float dx = S[3] - px, dy = S[7] - py, dz = S[11] - pz; const float len = sqrtf(dx * dx + dy * dy + dz * dz);
-        Trk* t = nullptr; Trk* fr = nullptr; for (int i = 0; i < 24; i++) { if (g_trk[i].idx == idx) { t = &g_trk[i]; break; } if (!g_trk[i].idx && !fr) fr = &g_trk[i]; }
-        if (!t) { if (len >= 170.0f || !fr) continue; t = fr; *t = { idx, len, 0, false, 0, now }; }
+        Trk* t = nullptr; Trk* fr = nullptr; for (int i = 0; i < 20; i++) { if (g_trk[i].idx == idx) { t = &g_trk[i]; break; } if (!g_trk[i].idx && !fr) fr = &g_trk[i]; }
+        if (!t) { if (len >= 170.0f || !fr) continue; t = fr; t->idx = idx; t->owned = false; t->refOk = false; t->path = t->bad = 0; t->away = 0;
+            const int rowEnd = (idx / 1024 + 1) * 1024; int nb = 1; while (nb < 4 && idx + (nb + 1) * 3 <= rowEnd && idx + (nb + 1) * 3 <= lim && (uint16_t)((uint16_t)now - g_slotSeen[idx + nb * 3]) >= 4) nb++; t->nb = nb; }
         t->seq = now;
-        if (len < 170.0f && fabsf(len - t->ref) < 60.0f) { t->viol = 0; t->path += step; if (t->path > 250.0f) t->owned = true; }
-        else if (t->owned && len < 170.0f) { t->ref = len; t->viol = 0; }            // moved on the body (drawn, sheathed): still ours
-        else if (t->owned) { if (++t->viol > 20) *t = {}; }
-        else { t->ref = len; t->path = 0; }
+        if (len >= 170.0f) { if (++t->away > 20) { t->idx = 0; continue; } } else t->away = 0;
+        bool any = false;
+        for (int pb = 0; pb < t->nb; pb++) {
+            const float* Sp = tex + (idx + pb * 3) * 4; uint64_t al = t->refOk ? t->alive[pb] : ~0ull;
+            for (int b = 0; b < 48; b++) {
+                if (!((al >> b) & 1)) continue; if (!invOk[b]) { al &= ~(1ull << b); continue; }
+                const float* Sb = tex + b * 12; const float* I = inv[b]; float C[12];
+                for (int r = 0; r < 3; r++) { for (int c2 = 0; c2 < 3; c2++) C[r * 4 + c2] = I[r * 3] * Sp[c2] + I[r * 3 + 1] * Sp[4 + c2] + I[r * 3 + 2] * Sp[8 + c2];
+                    C[r * 4 + 3] = I[r * 3] * (Sp[3] - Sb[3]) + I[r * 3 + 1] * (Sp[7] - Sb[7]) + I[r * 3 + 2] * (Sp[11] - Sb[11]); }
+                float* R = t->ref[pb][b];
+                if (!t->refOk) { memcpy(R, C, 48); continue; }
+                bool same = true; for (int e2 = 0; e2 < 12 && same; e2++) same = fabsf(C[e2] - R[e2]) < ((e2 & 3) == 3 ? 0.012f : 0.005f);
+                if (!same) al &= ~(1ull << b);
+            }
+            t->alive[pb] = al; if (al) any = true;
+        }
+        if (!t->refOk) { t->refOk = true; t->path = 0; }
+        else if (any) { t->path += step; if (t->path >= 60.0f) { if (!t->owned) Log("fp: equipment at bone texture %d,%d is the player's (rigid to a player bone over %.0f units)", idx % 1024, idx / 1024, t->path); t->owned = true; t->bad = 0; } }
+        else { t->bad += t->path + step; t->refOk = false; t->path = 0;   // relation broken: start again from this frame
+            if (t->owned && t->bad > 150.0f) { t->owned = false; Log("fp: equipment at bone texture %d,%d no longer follows the player", idx % 1024, idx / 1024); } }
         if (t->idx && t->owned && nEq < 16) eq[nEq++] = { idx, now };
     }
     for (int i = 0; i < 16; i++) g_eqSlot[i] = i < nEq ? eq[i] : EqSlot{ 0, 0 };
-    if (!g_fpTurn || g_turnPath < 250.0f) return;
+    if (!g_fpTurn || g_turnPath < 60.0f) return;
     float lx, lz; if (!dxr::FpLookDir(&lx, &lz)) return;
     const float fx = tex[2], fz = tex[10], fl = sqrtf(fx * fx + fz * fz); if (!(fl > 20)) return;   // player bone 0, packed +z = forward
     float dd = atan2f(lx, lz) - atan2f(fx, fz); while (dd > 3.14159265f) dd -= 6.2831853f; while (dd < -3.14159265f) dd += 6.2831853f;
@@ -705,6 +737,8 @@ static void MmUnlock(IDirect3DTexture9* t) {
             if (g_fpTurn < 0) g_fpTurn = GetPrivateProfileIntW(L"VR", L"FpTurnBody", 1, g_ini);
             if (g_fpQok && m.rc.right >= 1024 && m.pitch == 16384) FpTurnSkeletons((float*)m.bits, m.rc.bottom < 16 ? (int)m.rc.bottom : 16);
             memcpy(g_plBone, m.bits, sizeof g_plBone); memcpy(g_plBoneRoot, g_fpRoot, 12); g_plBoneSeq = g_camSeq;
+            {   TexBones* e = &g_tb[0]; for (int i2 = 0; i2 < 4; i2++) { if (g_tb[i2].t == m.t) { e = &g_tb[i2]; break; } if (g_tb[i2].seq < e->seq) e = &g_tb[i2]; }
+                e->t = m.t; memcpy(e->b, m.bits, sizeof e->b); e->seq = g_camSeq; }
             if (m.pitch == 16384) { const int rows = m.rc.bottom < 16 ? (int)m.rc.bottom : 16; memcpy(g_boneTex, m.bits, (size_t)rows * 16384); g_boneTexOk = true; }
         }
         if (g_fpProbe && m.bits && m.rc.left >= 0 && m.rc.top >= 0 && m.rc.right <= (LONG)m.w && m.rc.bottom <= (LONG)m.h)
@@ -751,6 +785,8 @@ static int FpClipPre(IDirect3DDevice9* d) {
     if (sk[0] <= 0.0f) return 0;
     {   const int tx = (int)(sk[1] * 1024.0f + 0.5f), ty = (int)(sk[2] * 64.0f + 0.5f); if (tx >= 0 && tx < 1024 && ty >= 0 && ty < 16) g_slotSeen[ty * 1024 + tx] = (uint16_t)g_camSeq; }
     if (v->shadow) return 0;
+    const float (*pb)[12] = g_plBone; long pbSeq = g_plBoneSeq;
+    {   IDirect3DBaseTexture9* bt = nullptr; if (SUCCEEDED(d->GetTexture(D3DVERTEXTEXTURESAMPLER0 + v->samp, &bt)) && bt) { for (int i = 0; i < 4; i++) if ((void*)g_tb[i].t == (void*)bt) { pb = g_tb[i].b; pbSeq = g_tb[i].seq; break; } bt->Release(); } }
     if (sk[1] != 0.0f || sk[2] != 0.0f) {
         // build 119: another skeleton. Equipment carried by the player (bow, quiver, shield, sheathed weapons: small models,
         // bone scale under 200 where characters have 240 and more, sitting on the player) is not drawn behind the chest's back
@@ -761,8 +797,8 @@ static int FpClipPre(IDirect3DDevice9* d) {
         if (tx < 0 || tx > 1021 || ty < 0 || ty > 15) return 0;
         {   const int idx = ty * 1024 + tx; bool mine = false; for (int i = 0; i < 16 && !mine; i++) mine = g_eqSlot[i].idx == idx; if (!mine) return 0; }
         if (!g_fpHideBack) return 0;
-        float J[3], U[3], F[3]; if (!FpHeadFrame(g_plBone[15], J, U, F)) return 0;
-        const float* C = g_plBone[13]; float cf[3] = { C[2], C[6], C[10] }; const float cl = sqrtf(cf[0] * cf[0] + cf[1] * cf[1] + cf[2] * cf[2]);   // chest forward
+        float J[3], U[3], F[3]; if (!FpHeadFrame(pb[15], J, U, F)) return 0;
+        const float* C = pb[13]; float cf[3] = { C[2], C[6], C[10] }; const float cl = sqrtf(cf[0] * cf[0] + cf[1] * cf[1] + cf[2] * cf[2]);   // chest forward
         if (cl > 20) { cf[0] /= cl; cf[1] /= cl; cf[2] /= cl; } else memcpy(cf, F, 12);
         const float w[4] = { cf[0], cf[1], cf[2], -(cf[0] * J[0] + cf[1] * J[1] + cf[2] * J[2]) + 6.0f }; float cp[4];
         if (!dxr::WorldPlaneToClip(w, cp)) return 0;
@@ -770,8 +806,8 @@ static int FpClipPre(IDirect3DDevice9* d) {
         return 1;
     }
     float J[3], U[3], F[3];
-    if (g_fpQok && FpHeadFrame(g_plBone[15], J, U, F)) {
-        static long mSeq = -1; const long bs = g_plBoneSeq;
+    if (g_fpQok && FpHeadFrame(pb[15], J, U, F)) {
+        static long mSeq = -1; const long bs = pbSeq;
         if (g_replay == 0 && bs != mSeq) {   // once per skeleton frame: the drawn head's eye point against the camera's eye point
             float e[3]; if (dxr::ReplayFpEye(e)) { mSeq = bs; for (int i = 0; i < 3; i++) g_fpLagD[i] = J[i] + U[i] * kFpEyeUp + F[i] * kFpEyeFwd - e[i]; InterlockedIncrement(&g_fpLagN); }
         }
