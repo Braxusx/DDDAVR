@@ -296,7 +296,7 @@ static int g_track = 1, g_headPos = 1, g_lag = 0; static float g_scale = 100.0f;
 static bool g_frameOpen; static XrFrameState g_fs{ XR_TYPE_FRAME_STATE };
 static Q g_refYaw{ 0, 0, 0, 1 }; static float g_refPos[3]; static bool g_refSet, g_wantRef;
 static long g_camCalls, g_camApplied;
-static int g_fp, g_autoRecenter = 1; static float g_fpUp, g_fpFwd = 0.0f, g_fpHide = 0.22f, g_fpBarPush = 65.0f, g_fpBarLift = 12.0f, g_fpEye[3]; static volatile bool g_fpEyeValid, g_fpActive;   // build 108
+static int g_fp, g_autoRecenter = 1; static float g_fpUp, g_fpFwd = 0.0f, g_fpHide = 0.22f, g_fpBarPush = 65.0f, g_fpBarLift = 12.0f, g_fpEye[3]; static volatile bool g_fpEyeValid, g_fpActive, g_fpLookOk; static float g_fpLook[2];   // build 108
 
 void ConfigureTracking(const wchar_t* ini) {
     g_track = GetPrivateProfileIntW(L"VR", L"HeadTracking", 1, ini);
@@ -322,6 +322,7 @@ void ConfigureTracking(const wchar_t* ini) {
 // the view is rebuilt level (the game camera's heading only, world up = +y) before the head pose is applied.
 void SetFpEye(const float* target, bool valid) { if (valid) memcpy(g_fpEye, target, 12); g_fpEyeValid = valid; }
 bool FirstPerson() { return g_fp != 0; }
+bool FpLookDir(float* fx, float* fz) { if (!g_fpLookOk || !g_fpActive) return false; *fx = g_fpLook[0]; *fz = g_fpLook[1]; return true; }
 // build 111: the player's own meshes are cut away within FpHide metres of the eye plane (head, hair, helmet); the plane is given
 // in clip space for IDirect3DDevice9::SetClipPlane: view depth - d >= 0, with depth = w and 1 = (z + P10 w) / P14
 bool FpClipPlane(float* pl) {
@@ -653,6 +654,10 @@ bool ApplyToCamera(float* V, float* P) {
     if (row) { for (int i = 0; i < 4; i++) for (int j = 0; j < 4; j++) { float a = 0; for (int k = 0; k < 4; k++) a += V[i * 4 + k] * M[k * 4 + j]; out[i * 4 + j] = a; } }   // V' = V * M
     else { for (int i = 0; i < 4; i++) for (int j = 0; j < 4; j++) { float a = 0; for (int k = 0; k < 4; k++) a += M[k * 4 + i] * V[k * 4 + j]; out[i * 4 + j] = a; } }    // V' = M^T * V
     memcpy(V, out, sizeof out);
+    if (fpOn && row) {   // build 118: where the head looks, level, in the world (view z axis = column 2; the view looks down -s z)
+        float fx = V[2] * (s > 0 ? 1.f : -1.f), fz = V[10] * (s > 0 ? 1.f : -1.f), l = sqrtf(fx * fx + fz * fz);
+        if (l > 0.2f) { g_fpLook[0] = fx / l; g_fpLook[1] = fz / l; g_fpLookOk = true; }
+    } else g_fpLookOk = false;
     {   // the game's own frustum (for the UI panel) and its projection rows (for FixUiProjRow)
         float xs0 = row ? P[0] : P[0], ys0 = P[5], p20 = row ? P[8] : P[2], p21 = row ? P[9] : P[6];
         if (xs0 > 1e-4f && ys0 > 1e-4f) { p.gt[0] = (-1 - p20 / s) / xs0; p.gt[1] = (1 - p20 / s) / xs0; p.gt[2] = (-1 - p21 / s) / ys0; p.gt[3] = (1 - p21 / s) / ys0; p.gtValid = true; }

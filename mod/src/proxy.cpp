@@ -1779,6 +1779,7 @@ static void FpFindTarget(void* cam, const float* V, const float* P) {
                 // feet), not on the camera's target, which is smoothed and trails by up to 60 cm when running. Height = the target's
                 // height above the feet, taken while standing. No character under the target (cutscene cameras) -> no first person.
                 static float h; static float lastRoot[3]; static DWORD lastT; static int state = -1;
+                static float vstep2[3];
                 const uint8_t* u = Readable(o + 0x70, 4) ? *(const uint8_t* const*)(o + 0x70) : nullptr; float rp[3]; bool ok = false;
                 if (u && !((uintptr_t)u & 3) && Readable(u, 0x50) && FpVec(u, 0x40, rp)) {
                     float hx = rp[0] - tv[0], hz = rp[2] - tv[2], dy = tv[1] - rp[1];
@@ -1787,6 +1788,7 @@ static void FpFindTarget(void* cam, const float* V, const float* P) {
                         float mv = fabsf(rp[0] - lastRoot[0]) + fabsf(rp[1] - lastRoot[1]) + fabsf(rp[2] - lastRoot[2]);
                         if (h < 60 || nowT - lastT > 2000) h = dy; else if (mv < 0.5f) h += (dy - h) * 0.05f;
                         const float vstep[3] = { rp[0] - lastRoot[0], rp[1] - lastRoot[1], rp[2] - lastRoot[2] };
+                        memcpy(vstep2, vstep, 12);
                         memcpy(lastRoot, rp, 12); lastT = nowT;
                         float eye[3] = { rp[0], rp[1] + h, rp[2] };
                         {   // build 116: the eye sits on the head bone - at the eyes' place, measured from the head joint (where the
@@ -1834,6 +1836,15 @@ static void FpFindTarget(void* cam, const float* V, const float* P) {
                                         const long ln = g_fpLagN;
                                         if (ln != lastLagN) { lastLagN = ln;
                                             if (vv > 4.0f && vv < 2500.0f) { float c = (g_fpLagD[0] * vstep[0] + g_fpLagD[1] * vstep[1] + g_fpLagD[2] * vstep[2]) / vv; if (c > 2) c = 2; if (c < -2) c = -2; lag += 0.08f * c; if (lag < 0) lag = 0; if (lag > 6) lag = 6; } }
+                                        {   // build 118: the head's bob and sway over the body are smoothed (FpSmooth seconds; the walk and run
+                                            // cycles shook the view); the body's own travel and the lead are not
+                                            static float tau = -1; if (tau < 0) { wchar_t b2[32]; GetPrivateProfileStringW(L"VR", L"FpSmooth", L"0.30", b2, 32, g_ini); tau = (float)_wtof(b2); if (tau < 0) tau = 0; if (tau > 2) tau = 2; Log("fp: head motion smoothing %.2f s", tau); }
+                                            static float os[3]; static double lastMs; const double ms = NowMs(); const double dt = (ms - lastMs) * 0.001; lastMs = ms;
+                                            float o[3] = { e[0] - rp[0], e[1] - rp[1], e[2] - rp[2] };
+                                            if (tau <= 0.001f || dt <= 0 || dt > 0.5) memcpy(os, o, 12);
+                                            else { const float al = 1.0f - expf(-(float)dt / tau); for (int i = 0; i < 3; i++) os[i] += (o[i] - os[i]) * al; }
+                                            for (int i = 0; i < 3; i++) e[i] = rp[i] + os[i];
+                                        }
                                         if (vv < 2500.0f) for (int i = 0; i < 3; i++) e[i] += vstep[i] * lag;
                                         const float dx = e[0] - rp[0], dy2 = e[1] - (rp[1] + h), dz = e[2] - rp[2];
                                         if (dx * dx + dz * dz < 120.f * 120.f && dy2 > -150 && dy2 < 70) { memcpy(eye, e, 12); used = true; bad = 0; }
@@ -1849,6 +1860,38 @@ static void FpFindTarget(void* cam, const float* V, const float* P) {
                     }
                 }
                 if (!ok) dxr::SetFpEye(nullptr, false);
+                if (ok && dxr::FirstPerson()) {   // build 118: the body turns with the view while standing (FpTurnBody)
+                    // The character's rotation is expected as a quaternion at +0x50 (after the position at +0x40). It is used only
+                    // after it has agreed with the drawn skeleton's facing (bone 0) over a spread of directions.
+                    static int turn = -1; if (turn < 0) turn = GetPrivateProfileIntW(L"VR", L"FpTurnBody", 1, g_ini);
+                    static int agree, differ, stillN, wrote, verified; static float psi0; static bool have0, spread; static DWORD lastTl; static float lastErr = -1; static long seqSeen = -1;
+                    static float wantPsi; static int sinceWrite = -1;
+                    const float* S0 = g_plBone[0]; float bf[2] = { S0[2], S0[10] }; const float bl = sqrtf(bf[0] * bf[0] + bf[1] * bf[1]);
+                    float* qd = (float*)(u + 0x50);
+                    if (turn && bl > 20 && g_plBoneSeq >= 0 && g_camSeq - g_plBoneSeq <= 2 && Readable(u + 0x50, 16)) {
+                        bf[0] /= bl; bf[1] /= bl; const float psiB = atan2f(bf[0], bf[1]);
+                        const float qn = qd[0] * qd[0] + qd[1] * qd[1] + qd[2] * qd[2] + qd[3] * qd[3];
+                        const float qf[2] = { 2 * (qd[0] * qd[2] + qd[3] * qd[1]), 1 - 2 * (qd[0] * qd[0] + qd[1] * qd[1]) };   // (0,0,1) turned by q
+                        const bool unit = fabsf(qn - 1) < 0.02f; const float dot = qf[0] * bf[0] + qf[1] * bf[1];
+                        if (verified == 0 && g_plBoneSeq != seqSeen) { seqSeen = g_plBoneSeq;
+                            if (unit && dot > 0.96f) { agree++; if (!have0) { have0 = true; psi0 = psiB; } float dd = psiB - psi0; while (dd > 3.14159f) dd -= 6.28319f; while (dd < -3.14159f) dd += 6.28319f; if (fabsf(dd) > 1.0f) spread = true; }
+                            else if (++differ == 200 && agree < 20) { verified = -1; Log("fp: body turning not available - the value at character +0x50 is not its rotation (%.3f %.3f %.3f %.3f, skeleton faces %.2f rad)", qd[0], qd[1], qd[2], qd[3], psiB); }
+                            if (agree >= 60 && spread && agree > differ * 4) { verified = 1; Log("fp: character rotation confirmed at +0x50 (%d frames agree, %d differ) - the body turns with the view while standing", agree, differ); }
+                        }
+                        const float mvv = fabsf(vstep2[0]) + fabsf(vstep2[1]) + fabsf(vstep2[2]);
+                        stillN = mvv < 0.05f ? stillN + 1 : 0;
+                        float lx, lz;
+                        if (verified == 1 && unit && stillN >= 12 && dxr::FpLookDir(&lx, &lz)) {
+                            const float psiV = atan2f(lx, lz), psiQ = atan2f(qf[0], qf[1]); float dd = psiV - psiQ; while (dd > 3.14159f) dd -= 6.28319f; while (dd < -3.14159f) dd += 6.28319f;
+                            if (fabsf(dd) > 0.12f) {   // 7 degrees of slack; then follow at up to 8 rad/s
+                                const float stepMax = 8.0f / 60.0f; const float st = dd > stepMax ? stepMax : dd < -stepMax ? -stepMax : dd; const float np = psiQ + st;
+                                qd[0] = 0; qd[1] = sinf(np * 0.5f); qd[2] = 0; qd[3] = cosf(np * 0.5f); wrote++; wantPsi = np; sinceWrite = 0;
+                            }
+                        }
+                        if (sinceWrite >= 0 && ++sinceWrite == 4) { float dd = psiB - wantPsi; while (dd > 3.14159f) dd -= 6.28319f; while (dd < -3.14159f) dd += 6.28319f; lastErr = fabsf(dd); sinceWrite = -1; }
+                        if (nowT - lastTl > 10000 && (wrote || verified == 0)) { lastTl = nowT; Log("fp: body turn - rotation check %s (%d agree / %d differ, spread %d), %d writes in 10 s, skeleton 3 frames after a write is %.2f rad from the written direction", verified == 1 ? "passed" : verified < 0 ? "failed" : "running", agree, differ, (int)spread, wrote, lastErr); wrote = 0; }
+                    }
+                }
                 g_fpHideOn = ok && dxr::FirstPerson(); g_fpWantBones = g_fpHideOn; g_fpRootOk = ok; InterlockedIncrement(&g_camSeq);
                 { static DWORD lastC; if (g_fpHideOn && nowT - lastC > 10000) { lastC = nowT; Log("fp: own-body clip plane used on %ld draws in the last 10 s", InterlockedExchange(&g_fpClipped, 0)); } }
                 if ((int)ok != state) { state = ok; Log("fp: %s (camera class %p, distance %.0f)", ok ? "character found under the camera target - first person available" : "no character under the camera target - first person paused", *(void* const*)o, dist); }
