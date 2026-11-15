@@ -594,18 +594,25 @@ bool WorldGuiToEye(int mode, float x, float y, float z, float* X, float* Y, floa
         struct BarTrk { float z, W[3]; DWORD tick; }; static BarTrk bt[16];
         const float rn = sqrtf(r[0] * r[0] + r[1] * r[1] + r[2] * r[2]), an = rn > 1e-6f ? fabsf(a) / rn : 0;
         float w = (an - 0.15f) / 0.30f; if (w < 0) w = 0; if (w > 1) w = 1;
-        const DWORD nowT = GetTickCount(); BarTrk* tk = nullptr;
-        for (auto& e : bt) if (e.tick && (LONG)(nowT - e.tick) < 500 && fabsf(e.z - z) < 12.0f && (!tk || fabsf(e.z - z) < fabsf(tk->z - z))) tk = &e;
-        {   static long nAll, nPrior, nRaw; static DWORD lastL; nAll++; if (w < 0.5f) { if (tk) nPrior++; else nRaw++; }
-            if (nowT - lastL > 10000) { lastL = nowT; if (nAll) Log("fp: name bars - %ld placements in 10 s: %ld with the depth taken from the remembered place, %ld badly conditioned without one", nAll, nPrior, nRaw); nAll = nPrior = nRaw = 0; } }
-        if (tk && w < 1) {
-            float Wh[3], u[3]; for (int j = 0; j < 3; j++) Wh[j] = tk->W[0] * c.V[j] + tk->W[1] * c.V[4 + j] + tk->W[2] * c.V[8 + j] + c.V[12 + j];   // head view
-            for (int j = 0; j < 3; j++) u[j] = Wh[j] - c.Mh[12 + j];   // from the game camera (its place in the head view)
-            const float ul = sqrtf(u[0] * u[0] + u[1] * u[1] + u[2] * u[2]);
-            if (ul > 1.0f && rn > 1e-6f) {
-                float tp = 0; for (int j = 0; j < 3; j++) tp += (Wh[j] - u[j] / ul * g_fpBarPush) * r[j]; tp /= rn * rn;   // the anchor that belongs to that place, on this ray
-                t = w * t + (1 - w) * tp; pe[0] = r[0] * t; pe[1] = r[1] * t; pe[2] = r[2] * t;
-            }
+        const DWORD nowT = GetTickCount(); BarTrk* tk = nullptr; float tkTp = 0;
+        // build 138: a remembered bar is found by where it is, not by its depth value (that changes fast while the right stick
+        // tilts the game camera, so the bar was "new" again and again): the anchor that belongs to the remembered place must lie
+        // within 45 units of this frame's ray. And the remembered depth now always leads; the equation only corrects it, at a
+        // rate set by how well conditioned it is (full weight: 0.15 s), so its errors no longer show as movement.
+        if (rn > 1e-6f) { float best = 45.0f;
+            for (auto& e : bt) { if (!e.tick || (LONG)(nowT - e.tick) >= 1500) continue;
+                float Wh[3], u[3], A[3]; for (int j = 0; j < 3; j++) Wh[j] = e.W[0] * c.V[j] + e.W[1] * c.V[4 + j] + e.W[2] * c.V[8 + j] + c.V[12 + j];   // head view
+                for (int j = 0; j < 3; j++) u[j] = Wh[j] - c.Mh[12 + j];   // from the game camera (its place in the head view)
+                const float ul = sqrtf(u[0] * u[0] + u[1] * u[1] + u[2] * u[2]); if (ul < 1.0f) continue;
+                float tp = 0; for (int j = 0; j < 3; j++) { A[j] = Wh[j] - u[j] / ul * g_fpBarPush; tp += A[j] * r[j]; } tp /= rn * rn;
+                float d2 = 0; for (int j = 0; j < 3; j++) { const float q = A[j] - r[j] * tp; d2 += q * q; }
+                const float dd = sqrtf(d2); if (dd < best) { best = dd; tk = &e; tkTp = tp; } } }
+        {   static long nAll, nPrior, nRaw; static DWORD lastL; nAll++; if (tk) nPrior++; else if (w < 0.5f) nRaw++;
+            if (nowT - lastL > 10000) { lastL = nowT; if (nAll) Log("fp: name bars - %ld placements in 10 s: %ld on a remembered place, %ld badly conditioned without one", nAll, nPrior, nRaw); nAll = nPrior = nRaw = 0; } }
+        if (tk) {
+            float dt = (float)(LONG)(nowT - tk->tick) * 0.001f; if (dt < 0) dt = 0; if (dt > 0.1f) dt = 0.1f;
+            float g = w * w * dt / 0.15f; if (g > 1) g = 1;
+            t = tkTp + g * (t - tkTp); pe[0] = r[0] * t; pe[1] = r[1] * t; pe[2] = r[2] * t;
         }
         float pg[3]; for (int j = 0; j < 3; j++) pg[j] = pe[0] * Mi[j] + pe[1] * Mi[4 + j] + pe[2] * Mi[8 + j] + Mi[12 + j];   // game view (camera at 0)
         const float l = sqrtf(pg[0] * pg[0] + pg[1] * pg[1] + pg[2] * pg[2]);
@@ -613,7 +620,7 @@ bool WorldGuiToEye(int mode, float x, float y, float z, float* X, float* Y, floa
             const float f = (l + g_fpBarPush) / l; for (int j = 0; j < 3; j++) pg[j] *= f;
             float pn[3]; for (int j = 0; j < 3; j++) pn[j] = pg[0] * c.Mh[j] + pg[1] * c.Mh[4 + j] + pg[2] * c.Mh[8 + j] + c.Mh[12 + j];
             if (tk || w >= 0.5f) {   // remember where it is in the world (a new bar only from a depth that can be trusted)
-                if (!tk) { tk = &bt[0]; for (auto& e : bt) if (!e.tick || (LONG)(nowT - e.tick) >= 500) { tk = &e; break; } else if ((LONG)(e.tick - tk->tick) < 0) tk = &e; }
+                if (!tk) { tk = &bt[0]; for (auto& e : bt) if (!e.tick || (LONG)(nowT - e.tick) >= 1500) { tk = &e; break; } else if ((LONG)(e.tick - tk->tick) < 0) tk = &e; }
                 for (int j = 0; j < 3; j++) tk->W[j] = pn[0] * c.Vi[j] + pn[1] * c.Vi[4 + j] + pn[2] * c.Vi[8 + j] + c.Vi[12 + j];
                 tk->z = z; tk->tick = nowT | 1; }
             pe[0] = pn[0] + c.V[4] * g_fpBarLift; pe[1] = pn[1] + c.V[5] * g_fpBarLift; pe[2] = pn[2] + c.V[6] * g_fpBarLift;   // world up = row 1 of V
