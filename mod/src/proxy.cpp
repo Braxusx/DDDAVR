@@ -601,7 +601,7 @@ static IDirect3DTexture9* g_btCur; static Snap g_snap[6]; static Snap* volatile 
 // another character can do that. A piece is the player's once that has held over 60 units of the player's own movement; it is
 // re-tested when the relation breaks (drawn, sheathed) and dropped after 150 units of movement without one, or 170 away.
 // (123 went by a steady distance, which simulated or swinging pieces fail - they stayed unturned beside the turned body.)
-struct Trk { int idx; bool owned, refOk; int nb, frames; uint64_t alive[4]; float ref[4][48][12]; float path, bad; int away; long seq; };
+struct Trk { int idx; bool owned, refOk; int nb, frames; uint64_t alive[4]; float ref[4][48][12]; float path, bad, refRoot[3], refPsi; int away; long seq; };
 // relations seen on pieces that were the player's (piece bone, player bone, the constant): a piece showing one again is the player's
 // at once - a sheathed bow is back without the player having to walk first
 struct RelMem { int pb, b; float C[12]; }; static RelMem g_relMem[48]; static int g_relN, g_relNext;
@@ -628,9 +628,12 @@ static void FpTurnSkeletons(float* tex, int rows, int ti) {
         if ((uint16_t)((uint16_t)now - g_slotSeen[idx]) >= 4) continue;
         const float* S = tex + idx * 4; const float sc = sqrtf(S[0] * S[0] + S[4] * S[4] + S[8] * S[8]);
         if (!(sc > 1.0f && sc < 200.0f)) continue;
-        const float dx = S[3] - px, dy = S[7] - py, dz = S[11] - pz; const float len = sqrtf(dx * dx + dy * dy + dz * dz);
+        const float dx = S[3] - px, dy = S[7] - py, dz = S[11] - pz; const float hd = sqrtf(dx * dx + dz * dz);
+        // build 129: reach by horizontal distance and height (a bow on the back has its reference point 2 m up - 128's 170-unit
+        // sphere never even considered it)
+        const bool nearP = hd < 220.0f && dy > -80.0f && dy < 330.0f; const float len = (hd < 300.0f && dy > -150.0f && dy < 400.0f) ? 0.0f : 1000.0f;
         Trk* t = nullptr; Trk* fr = nullptr; for (int i = 0; i < 20; i++) { if (g_trk[i].idx == idx) { t = &g_trk[i]; break; } if (!g_trk[i].idx && !fr) fr = &g_trk[i]; }
-        if (!t) { if (len >= 170.0f || !fr) continue; t = fr; t->idx = idx; t->owned = false; t->refOk = false; t->path = t->bad = 0; t->away = 0;
+        if (!t) { if (!nearP || !fr) continue; t = fr; t->idx = idx; t->owned = false; t->refOk = false; t->path = t->bad = 0; t->away = 0;
             const int rowEnd = (idx / 1024 + 1) * 1024; int nb = 1; while (nb < 4 && idx + (nb + 1) * 3 <= rowEnd && idx + (nb + 1) * 3 <= lim && (uint16_t)((uint16_t)now - g_slotSeen[idx + nb * 3]) >= 4) nb++; t->nb = nb; }
         t->seq = now;
         if (len >= 170.0f) { if (++t->away > 20) { t->idx = 0; continue; } } else t->away = 0;
@@ -652,13 +655,18 @@ static void FpTurnSkeletons(float* tex, int rows, int ti) {
             }
             t->alive[pb] = al; if (al) any = true;
         }
-        if (!t->refOk) { t->refOk = true; t->path = 0; t->frames = 0; }
-        else if (any) { t->path += step < 12.0f ? step : 12.0f; t->frames++; if (t->path >= 60.0f && t->frames >= 20) {
+        if (!t->refOk) { t->refOk = true; t->path = 0; t->frames = 0; memcpy(t->refRoot, g_fpRoot, 12); t->refPsi = psi; }
+        else if (any) {
+            // build 129: evidence = how far the player has actually got from where the comparison started (position, or heading), not
+            // movement added up - idle sway added up to "60 units" in a quarter of a minute and made a standing pawn's staff "the player's"
+            float dpsi = psi - t->refPsi; while (dpsi > 3.14159265f) dpsi -= 6.2831853f; while (dpsi < -3.14159265f) dpsi += 6.2831853f;
+            const float ax = g_fpRoot[0] - t->refRoot[0], ay = g_fpRoot[1] - t->refRoot[1], az = g_fpRoot[2] - t->refRoot[2];
+            t->path = sqrtf(ax * ax + ay * ay + az * az) + 60.0f * fabsf(dpsi); t->frames++; if (t->path >= 60.0f && t->frames >= 20) {
             if (t->bad == 0 || !t->owned) for (int pb = 0; pb < t->nb; pb++) { if (!t->alive[pb]) continue; int b = 0; while (!((t->alive[pb] >> b) & 1)) b++;   // remember this relation
                 bool known = false; for (int m2 = 0; m2 < g_relN && !known; m2++) known = g_relMem[m2].pb == pb && g_relMem[m2].b == b && fabsf(g_relMem[m2].C[3] - t->ref[pb][b][3]) < 0.012f && fabsf(g_relMem[m2].C[0] - t->ref[pb][b][0]) < 0.005f && fabsf(g_relMem[m2].C[5] - t->ref[pb][b][5]) < 0.005f && fabsf(g_relMem[m2].C[7] - t->ref[pb][b][7]) < 0.012f && fabsf(g_relMem[m2].C[11] - t->ref[pb][b][11]) < 0.012f;
                 if (!known) { RelMem& rm = g_relMem[g_relNext]; g_relNext = (g_relNext + 1) % 48; if (g_relN < 48) g_relN++; rm.pb = pb; rm.b = b; memcpy(rm.C, t->ref[pb][b], 48); }
                 break; } if (!t->owned) Log("fp: equipment at bone texture %d,%d is the player's (rigid to a player bone over %.0f units)", idx % 1024, idx / 1024, t->path); t->owned = true; t->bad = 0; } }
-        else { t->bad += t->path + step; t->refOk = false; t->path = 0;   // relation broken: start again from this frame
+        else { t->bad += step < 12.0f ? step : 12.0f; t->refOk = false; t->path = 0;   // relation broken: start again from this frame
             if (t->owned && t->bad > 150.0f) { t->owned = false; Log("fp: equipment at bone texture %d,%d no longer follows the player", idx % 1024, idx / 1024); } }
         if (t->idx && t->owned && nEq < 16) eq[nEq++] = { idx, now };
     }
@@ -832,7 +840,7 @@ static void FpProbeDraw(IDirect3DDevice9* d, UINT prims, UINT verts) {
 // drawn with a clip plane that removes everything within FpHide of the eye plane: the head goes, the body stays when looking down
 volatile bool g_fpHideOnX; static volatile bool& g_fpHideOn = g_fpHideOnX; static volatile long g_fpClipped, g_fpClippedEq;
 static HRESULT FpSetRS(IDirect3DDevice9* d, D3DRENDERSTATETYPE st, DWORD v);
-static float g_fpPlB[2][4];
+static float g_fpPlB[2][4], g_fpPl[6][4];
 extern IDirect3DTexture9* g_fpA2X; extern volatile long g_fpA2SeqX;
 static HRESULT FpTexLockRaw(IDirect3DTexture9* t, D3DLOCKED_RECT* lr, DWORD fl); static HRESULT FpTexUnlockRaw(IDirect3DTexture9* t);
 static IDirect3DBaseTexture9* g_fpPrevTex; static DWORD g_fpPrevSamp; static volatile long g_dgBound, g_dgSnapMatch, g_dgSnapOther;
@@ -922,12 +930,20 @@ static int FpClipPre(IDirect3DDevice9* d) {
         return rc | 1;
     }
     if (g_fpQok && FpHeadFrame(pb[15], J, U, F)) {
-        // pass A: everything below the neck. Pass B (FpClipSecond): above the neck only what is well in front of the face (raised hands, weapons)
-        const float Pn[3] = { J[0] - U[0] * 4.0f, J[1] - U[1] * 4.0f, J[2] - U[2] * 4.0f }, Pf[3] = { J[0] + F[0] * 24.0f, J[1] + F[1] * 24.0f, J[2] + F[2] * 24.0f };
-        const float un = U[0] * Pn[0] + U[1] * Pn[1] + U[2] * Pn[2];
-        const float wA[4] = { -U[0], -U[1], -U[2], un }, wB1[4] = { U[0], U[1], U[2], -un }, wB2[4] = { F[0], F[1], F[2], -(F[0] * Pf[0] + F[1] * Pf[1] + F[2] * Pf[2]) };
-        float cA[4];
-        if (dxr::WorldPlaneToClip(wA, cA) && dxr::WorldPlaneToClip(wB1, g_fpPlB[0]) && dxr::WorldPlaneToClip(wB2, g_fpPlB[1])) {
+        // build 129: only a box around the head is left out. Pass A: everything below the neck. Then, above the neck: what is to the
+        // right of the head, to its left, and in front of the face (FpClipMore). 116-128 dropped everything above the neck that was
+        // not 24 cm in front of the face, which cut a raised bow arm into a floating hand.
+        const float X[3] = { U[1] * F[2] - U[2] * F[1], U[2] * F[0] - U[0] * F[2], U[0] * F[1] - U[1] * F[0] };   // the head's side axis
+        const float Pn[3] = { J[0] - U[0] * 4.0f, J[1] - U[1] * 4.0f, J[2] - U[2] * 4.0f };
+        const float un = U[0] * Pn[0] + U[1] * Pn[1] + U[2] * Pn[2], xj = X[0] * J[0] + X[1] * J[1] + X[2] * J[2], fj = F[0] * J[0] + F[1] * J[1] + F[2] * J[2];
+        const float hw = 13.0f, hf = 17.0f;   // half width of the box, and how far it reaches in front of the head joint
+        const float wA[4] = { -U[0], -U[1], -U[2], un }, wUp[4] = { U[0], U[1], U[2], -un };
+        const float wR[4] = { X[0], X[1], X[2], -xj - hw }, wL[4] = { -X[0], -X[1], -X[2], xj - hw };          // side >= hw / side <= -hw
+        const float wRi[4] = { -X[0], -X[1], -X[2], xj + hw }, wLi[4] = { X[0], X[1], X[2], -xj + hw };       // |side| <= hw
+        const float wFr[4] = { F[0], F[1], F[2], -fj - hf };
+        float cA[4]; bool okp = dxr::WorldPlaneToClip(wA, cA) && dxr::WorldPlaneToClip(wUp, g_fpPl[0]) && dxr::WorldPlaneToClip(wR, g_fpPl[1]) && dxr::WorldPlaneToClip(wL, g_fpPl[2])
+            && dxr::WorldPlaneToClip(wRi, g_fpPl[3]) && dxr::WorldPlaneToClip(wLi, g_fpPl[4]) && dxr::WorldPlaneToClip(wFr, g_fpPl[5]);
+        if (okp) {
             d->SetClipPlane(0, cA); FpSetRS(d, D3DRS_CLIPPLANEENABLE, D3DCLIPPLANE0); InterlockedIncrement(&g_fpClipped);
             return rc | 3;
         }
@@ -936,7 +952,12 @@ static int FpClipPre(IDirect3DDevice9* d) {
     d->SetClipPlane(0, pl); FpSetRS(d, D3DRS_CLIPPLANEENABLE, D3DCLIPPLANE0); InterlockedIncrement(&g_fpClipped);
     return rc | 1;
 }
-static void FpClipSecond(IDirect3DDevice9* d) { d->SetClipPlane(0, g_fpPlB[0]); d->SetClipPlane(1, g_fpPlB[1]); FpSetRS(d, D3DRS_CLIPPLANEENABLE, D3DCLIPPLANE0 | D3DCLIPPLANE1); }
+static void FpClipMore(IDirect3DDevice9* d, int pass) {   // pass 0: above the neck, right of the head; 1: left of it; 2: in front of the face
+    d->SetClipPlane(0, g_fpPl[0]);
+    if (pass == 0) { d->SetClipPlane(1, g_fpPl[1]); FpSetRS(d, D3DRS_CLIPPLANEENABLE, D3DCLIPPLANE0 | D3DCLIPPLANE1); }
+    else if (pass == 1) { d->SetClipPlane(1, g_fpPl[2]); FpSetRS(d, D3DRS_CLIPPLANEENABLE, D3DCLIPPLANE0 | D3DCLIPPLANE1); }
+    else { d->SetClipPlane(1, g_fpPl[3]); d->SetClipPlane(2, g_fpPl[4]); d->SetClipPlane(3, g_fpPl[5]); FpSetRS(d, D3DRS_CLIPPLANEENABLE, D3DCLIPPLANE0 | D3DCLIPPLANE1 | D3DCLIPPLANE2 | D3DCLIPPLANE3); }
+}
 
 static IDirect3DBaseTexture9* g_curTex[8];
 static float g_psc[32][4];
@@ -1833,7 +1854,7 @@ template <class F> static void ReticleDraws(IDirect3DDevice9* d, const Tweak& tw
     float pc[2][4] = { { 0, 0, 0, a * 2.5f }, { 1, 1, 1, 0 } }; oPSC(d, 4, pc[0], 2);
 }
 static HRESULT STDMETHODCALLTYPE hkDP(IDirect3DDevice9* d, D3DPRIMITIVETYPE t, UINT a, UINT b) { R1NoteIfEye(); HPScope _hp(HP_DP); g_fDraws++; if (g_diagOn || CAPON) RefreshTexState(d); if (g_diagOn) DiagDraw(); if (g_inBandRT) return D3D_OK; if (g_movieHold > 0 && (RefreshStream(d), MovieBar(t, a, b))) return D3D_OK; OVERLAY_SKIP(); bool ui = UiPreDraw(d); UI_SKIP(); if (ui && (RefreshStream(d), ParkedIcon(t, a, b))) { UiPost(d, ui); return D3D_OK; } if (CAPON) { g_da = { 1, t, a, 0, b, nullptr, 0, 0, b, d }; CapDraw(RA, b); PostRec(RA, b); } Tweak tw; if (UiTweakPre(d, tw) == TW_RETICLE) ReticleDraws(d, tw, [&] { oDP(d, t, a, b); }); HRESULT hr = oDP(d, t, a, b); if (tw.kind) UiTweakPost(d, tw); UiPost(d, ui); return hr; }
-static HRESULT STDMETHODCALLTYPE hkDIP(IDirect3DDevice9* d, D3DPRIMITIVETYPE t, INT a, UINT b, UINT c, UINT e, UINT f) { R1NoteIfEye(); if (g_fpProbe) FpProbeDraw(d, f, c); const int fpClip = g_fpHideOn ? FpClipPre(d) : 0; for (int k = 0; k < g_intzN; k++) if (g_curDS == g_intz[k].surf) { g_intz[k].draws++; break; } HPScope _hp(HP_DIP); g_fDraws++; if (g_diagOn || CAPON) RefreshTexState(d); if (g_diagOn) DiagDraw(); if (g_inBandRT) return D3D_OK; OVERLAY_SKIP(); if (PrimPre(d, t, a, b, c, e, f)) return D3D_OK; bool ui = UiPreDraw(d); UI_SKIP(); if (CAPON) { g_da = { 2, t, (UINT)a, b, c, nullptr, 0, e, f, d }; CapDraw(RA, f); PostRec(RA, f); } static unsigned dipN; bool timed = g_prof && (++dipN & 15) == 0; double t0 = timed ? NowMs() : 0; Tweak tw; if (UiTweakPre(d, tw) == TW_RETICLE) ReticleDraws(d, tw, [&] { oDIP(d, t, a, b, c, e, f); }); HRESULT hr = oDIP(d, t, a, b, c, e, f); if (fpClip & 2) { FpClipSecond(d); oDIP(d, t, a, b, c, e, f); } if (fpClip & 1) oSetRS(d, D3DRS_CLIPPLANEENABLE, 0); if (fpClip & 4) FpUnbindPlayerTex(d); if (tw.kind) UiTweakPost(d, tw); if (timed) g_s.drawMs += (NowMs() - t0) * 16.0; UiPost(d, ui); PrimPost(d); return hr; }
+static HRESULT STDMETHODCALLTYPE hkDIP(IDirect3DDevice9* d, D3DPRIMITIVETYPE t, INT a, UINT b, UINT c, UINT e, UINT f) { R1NoteIfEye(); if (g_fpProbe) FpProbeDraw(d, f, c); const int fpClip = g_fpHideOn ? FpClipPre(d) : 0; for (int k = 0; k < g_intzN; k++) if (g_curDS == g_intz[k].surf) { g_intz[k].draws++; break; } HPScope _hp(HP_DIP); g_fDraws++; if (g_diagOn || CAPON) RefreshTexState(d); if (g_diagOn) DiagDraw(); if (g_inBandRT) return D3D_OK; OVERLAY_SKIP(); if (PrimPre(d, t, a, b, c, e, f)) return D3D_OK; bool ui = UiPreDraw(d); UI_SKIP(); if (CAPON) { g_da = { 2, t, (UINT)a, b, c, nullptr, 0, e, f, d }; CapDraw(RA, f); PostRec(RA, f); } static unsigned dipN; bool timed = g_prof && (++dipN & 15) == 0; double t0 = timed ? NowMs() : 0; Tweak tw; if (UiTweakPre(d, tw) == TW_RETICLE) ReticleDraws(d, tw, [&] { oDIP(d, t, a, b, c, e, f); }); HRESULT hr = oDIP(d, t, a, b, c, e, f); if (fpClip & 2) { for (int ps = 0; ps < 3; ps++) { FpClipMore(d, ps); oDIP(d, t, a, b, c, e, f); } } if (fpClip & 1) oSetRS(d, D3DRS_CLIPPLANEENABLE, 0); if (fpClip & 4) FpUnbindPlayerTex(d); if (tw.kind) UiTweakPost(d, tw); if (timed) g_s.drawMs += (NowMs() - t0) * 16.0; UiPost(d, ui); PrimPost(d); return hr; }
 static HRESULT STDMETHODCALLTYPE hkDPUP(IDirect3DDevice9* d, D3DPRIMITIVETYPE t, UINT a, const void* p, UINT s) { R1NoteIfEye(); g_fDraws++; if (g_diagOn || CAPON) RefreshTexState(d); if (g_diagOn) DiagDraw(); g_s.drawsUP++; OVERLAY_SKIP(); bool ui = UiPreDraw(d); UI_SKIP(); if (CAPON) { g_da = { 3, t, 0, 0, a, p, s, 0, a, d }; CapDraw(RA, a); PostRec(RA, a); } HRESULT hr = oDPUP(d, t, a, p, s); UiPost(d, ui); return hr; }
 static HRESULT STDMETHODCALLTYPE hkDIPUP(IDirect3DDevice9* d, D3DPRIMITIVETYPE t, UINT a, UINT b, UINT c, const void* i, D3DFORMAT f, const void* v, UINT s) { R1NoteIfEye();
     g_fDraws++; if (g_diagOn || CAPON) RefreshTexState(d); if (g_diagOn) DiagDraw(); g_s.drawsUP++; OVERLAY_SKIP(); bool ui = UiPreDraw(d); UI_SKIP(); if (CAPON) { g_da = { 4, t, a, b, c, v, s, 0, c, d }; CapDraw(RA, c); PostRec(RA, c); } HRESULT hr = oDIPUP(d, t, a, b, c, i, f, v, s); UiPost(d, ui); return hr;
