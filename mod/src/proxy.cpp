@@ -634,7 +634,9 @@ static void FpTurnSkeletons(float* tex, int rows, int ti) {
         const bool nearP = hd < 220.0f && dy > -80.0f && dy < 330.0f; const float len = (hd < 300.0f && dy > -150.0f && dy < 400.0f) ? 0.0f : 1000.0f;
         Trk* t = nullptr; Trk* fr = nullptr; for (int i = 0; i < 20; i++) { if (g_trk[i].idx == idx) { t = &g_trk[i]; break; } if (!g_trk[i].idx && !fr) fr = &g_trk[i]; }
         if (!t) { if (!nearP || !fr) continue; t = fr; t->idx = idx; t->owned = false; t->refOk = false; t->path = t->bad = 0; t->away = 0;
-            const int rowEnd = (idx / 1024 + 1) * 1024; int nb = 1; while (nb < 4 && idx + (nb + 1) * 3 <= rowEnd && idx + (nb + 1) * 3 <= lim && (uint16_t)((uint16_t)now - g_slotSeen[idx + nb * 3]) >= 4) nb++; t->nb = nb; }
+            // build 130: the piece's own first bone only. Models can have a single joint (three texels), so "the next three bones" were
+            // other models' - one of the player's one-joint pieces sitting right after the pawn's staff made the staff "the player's".
+            int nb = 1; t->nb = nb; }
         t->seq = now;
         if (len >= 170.0f) { if (++t->away > 20) { t->idx = 0; continue; } } else t->away = 0;
         bool any = false;
@@ -685,7 +687,7 @@ static void FpTurnSkeletons(float* tex, int rows, int ti) {
             for (int k = 0; k < 17; k++) {
                 int idx, cap;
                 if (k == 0) { idx = 0; cap = 96; }
-                else { const EqSlot& e = g_eqSlot[k - 1]; if (e.idx <= 0) continue; idx = e.idx; cap = 24; }
+                else { const EqSlot& e = g_eqSlot[k - 1]; if (e.idx <= 0) continue; idx = e.idx; cap = 24; }   // (stops at the next skeleton drawn)
                 const int rowEnd = (idx / 1024 + 1) * 1024;   // a skeleton does not run past the end of its row
                 if (idx + 3 > lim2 || idx + 3 > rowEnd) continue;
                 int n = 1; while (n < cap && idx + (n + 1) * 3 <= rowEnd && idx + (n + 1) * 3 <= lim2 && (uint16_t)((uint16_t)now - g_slotSeen[idx + n * 3]) >= 4) n++;   // up to the next skeleton drawn
@@ -840,7 +842,7 @@ static void FpProbeDraw(IDirect3DDevice9* d, UINT prims, UINT verts) {
 // drawn with a clip plane that removes everything within FpHide of the eye plane: the head goes, the body stays when looking down
 volatile bool g_fpHideOnX; static volatile bool& g_fpHideOn = g_fpHideOnX; static volatile long g_fpClipped, g_fpClippedEq;
 static HRESULT FpSetRS(IDirect3DDevice9* d, D3DRENDERSTATETYPE st, DWORD v);
-static float g_fpPlB[2][4], g_fpPl[6][4];
+static float g_fpPlB[2][4], g_fpPl[6][4]; static volatile bool g_fpNoCuts;   // F4 (test aid): no head cut, no gear hiding, no own bone texture
 extern IDirect3DTexture9* g_fpA2X; extern volatile long g_fpA2SeqX;
 static HRESULT FpTexLockRaw(IDirect3DTexture9* t, D3DLOCKED_RECT* lr, DWORD fl); static HRESULT FpTexUnlockRaw(IDirect3DTexture9* t);
 static IDirect3DBaseTexture9* g_fpPrevTex; static DWORD g_fpPrevSamp; static volatile long g_dgBound, g_dgSnapMatch, g_dgSnapOther;
@@ -1076,10 +1078,39 @@ static HRESULT STDMETHODCALLTYPE hkSetTex(IDirect3DDevice9* d, DWORD s, IDirect3
 // build 056: the shader classes are looked up when a shader is set (about 4000 times a frame), not at every draw (9000+)
 enum { VSF_PRIM = 1, VSF_PRIMSHIFT = 2, VSF_FLARE = 4, VSF_GUI = 8, PSF_GODRAYS = 1, PSF_DOF = 2, PSF_IMAGEPLANE = 4 };
 static unsigned g_curVSF, g_curPSF;
-static HRESULT STDMETHODCALLTYPE hkSetPS(IDirect3DDevice9* d, IDirect3DPixelShader9* p) { HPScope _hp(HP_SetPS); g_curPS = p;
+// build 130 (study): constant names of shaders that mention grass, fading or dithering, once per shader - to find what makes the
+// grass vanish around the first-person camera
+static void ShaderScan(void* ptr, const DWORD* fn, size_t nt, const char* kind) {
+    static void* seen[1024]; static int ns; static int logged;
+    for (int i = 0; i < ns; i++) if (seen[i] == ptr) return;
+    if (ns < 1024) seen[ns++] = ptr; else return;
+    if (logged >= 80) return;
+    for (size_t i = 1; i + 2 < nt; ) {
+        DWORD t = fn[i]; if ((t & 0xFFFF) != 0xFFFE) break;
+        size_t len = (t >> 16) & 0x7FFF;
+        if (len >= 8 && fn[i + 1] == 0x42415443) {   // 'CTAB'
+            const uint8_t* b = (const uint8_t*)&fn[i + 2]; const size_t bl = (len - 1) * 4;
+            DWORD cnt, off; memcpy(&cnt, b + 12, 4); memcpy(&off, b + 16, 4);
+            bool hit = false; char line[1400]; int ln = 0; line[0] = 0;
+            for (DWORD k = 0; k < cnt && off + (k + 1) * 20 <= bl; k++) {
+                const uint8_t* e = b + off + k * 20; DWORD nameOff; WORD rset, ridx, rcnt; memcpy(&nameOff, e, 4); memcpy(&rset, e + 4, 2); memcpy(&ridx, e + 6, 2); memcpy(&rcnt, e + 8, 2);
+                if (nameOff >= bl) continue; const char* nm = (const char*)b + nameOff; if (strnlen(nm, bl - nameOff) >= bl - nameOff) continue;
+                if (strstr(nm, "rass") || strstr(nm, "ade") || strstr(nm, "ither") || strstr(nm, "Near") || strstr(nm, "Dissolve") || strstr(nm, "Transparen")) hit = true;
+                if (ln < 1300) ln += snprintf(line + ln, sizeof line - ln, " %s %c%u%s", nm, rset == 2 ? 'c' : rset == 3 ? 's' : rset == 0 ? 'b' : 'i', ridx, rcnt > 1 ? "+" : "");
+            }
+            if (hit) { logged++; Log("shader study: %s %p:%s", kind, ptr, line); }
+            break;
+        }
+        i += len + 1;
+    }
+}
+static void ShaderScanVS(IDirect3DVertexShader9* p) { if (!p) return; UINT sz = 0; if (FAILED(p->GetFunction(nullptr, &sz)) || sz < 32 || sz > 262144) return; std::vector<DWORD> fn(sz / 4 + 1); if (SUCCEEDED(p->GetFunction(fn.data(), &sz))) ShaderScan(p, fn.data(), sz / 4, "vs"); }
+static void ShaderScanPS(IDirect3DPixelShader9* p) { if (!p) return; UINT sz = 0; if (FAILED(p->GetFunction(nullptr, &sz)) || sz < 32 || sz > 262144) return; std::vector<DWORD> fn(sz / 4 + 1); if (SUCCEEDED(p->GetFunction(fn.data(), &sz))) ShaderScan(p, fn.data(), sz / 4, "ps"); }
+extern volatile bool g_fpHideOnX;
+static HRESULT STDMETHODCALLTYPE hkSetPS(IDirect3DDevice9* d, IDirect3DPixelShader9* p) { HPScope _hp(HP_SetPS); g_curPS = p; if (g_fpHideOnX) ShaderScanPS(p);
     g_curPSF = p ? ((g_grN && IsGodRaysPS(p)) ? PSF_GODRAYS : 0) | ((g_dofN && IsDofPS(p)) ? PSF_DOF : 0) | ((g_ipN && IsImagePlanePS(p)) ? PSF_IMAGEPLANE : 0) : 0;
     return oSetPS(d, p); }
-static HRESULT STDMETHODCALLTYPE hkSetVS(IDirect3DDevice9* d, IDirect3DVertexShader9* p) { HPScope _hp(HP_SetVS); g_curVS = p;
+static HRESULT STDMETHODCALLTYPE hkSetVS(IDirect3DDevice9* d, IDirect3DVertexShader9* p) { HPScope _hp(HP_SetVS); g_curVS = p; if (g_fpHideOnX) ShaderScanVS(p);
     extern bool IsGuiVS(void* p);
     g_curVSF = p ? (IsGuiVS(p) ? VSF_GUI : 0) | ((g_primN && IsPrimVS(p)) ? VSF_PRIM : 0) | ((g_primN && IsPrimShiftVS(p)) ? VSF_PRIMSHIFT : 0) | ((g_flareN && IsFlareVS(p)) ? VSF_FLARE : 0) : 0;
     return oSetVS(d, p); }
@@ -1854,7 +1885,7 @@ template <class F> static void ReticleDraws(IDirect3DDevice9* d, const Tweak& tw
     float pc[2][4] = { { 0, 0, 0, a * 2.5f }, { 1, 1, 1, 0 } }; oPSC(d, 4, pc[0], 2);
 }
 static HRESULT STDMETHODCALLTYPE hkDP(IDirect3DDevice9* d, D3DPRIMITIVETYPE t, UINT a, UINT b) { R1NoteIfEye(); HPScope _hp(HP_DP); g_fDraws++; if (g_diagOn || CAPON) RefreshTexState(d); if (g_diagOn) DiagDraw(); if (g_inBandRT) return D3D_OK; if (g_movieHold > 0 && (RefreshStream(d), MovieBar(t, a, b))) return D3D_OK; OVERLAY_SKIP(); bool ui = UiPreDraw(d); UI_SKIP(); if (ui && (RefreshStream(d), ParkedIcon(t, a, b))) { UiPost(d, ui); return D3D_OK; } if (CAPON) { g_da = { 1, t, a, 0, b, nullptr, 0, 0, b, d }; CapDraw(RA, b); PostRec(RA, b); } Tweak tw; if (UiTweakPre(d, tw) == TW_RETICLE) ReticleDraws(d, tw, [&] { oDP(d, t, a, b); }); HRESULT hr = oDP(d, t, a, b); if (tw.kind) UiTweakPost(d, tw); UiPost(d, ui); return hr; }
-static HRESULT STDMETHODCALLTYPE hkDIP(IDirect3DDevice9* d, D3DPRIMITIVETYPE t, INT a, UINT b, UINT c, UINT e, UINT f) { R1NoteIfEye(); if (g_fpProbe) FpProbeDraw(d, f, c); const int fpClip = g_fpHideOn ? FpClipPre(d) : 0; for (int k = 0; k < g_intzN; k++) if (g_curDS == g_intz[k].surf) { g_intz[k].draws++; break; } HPScope _hp(HP_DIP); g_fDraws++; if (g_diagOn || CAPON) RefreshTexState(d); if (g_diagOn) DiagDraw(); if (g_inBandRT) return D3D_OK; OVERLAY_SKIP(); if (PrimPre(d, t, a, b, c, e, f)) return D3D_OK; bool ui = UiPreDraw(d); UI_SKIP(); if (CAPON) { g_da = { 2, t, (UINT)a, b, c, nullptr, 0, e, f, d }; CapDraw(RA, f); PostRec(RA, f); } static unsigned dipN; bool timed = g_prof && (++dipN & 15) == 0; double t0 = timed ? NowMs() : 0; Tweak tw; if (UiTweakPre(d, tw) == TW_RETICLE) ReticleDraws(d, tw, [&] { oDIP(d, t, a, b, c, e, f); }); HRESULT hr = oDIP(d, t, a, b, c, e, f); if (fpClip & 2) { for (int ps = 0; ps < 3; ps++) { FpClipMore(d, ps); oDIP(d, t, a, b, c, e, f); } } if (fpClip & 1) oSetRS(d, D3DRS_CLIPPLANEENABLE, 0); if (fpClip & 4) FpUnbindPlayerTex(d); if (tw.kind) UiTweakPost(d, tw); if (timed) g_s.drawMs += (NowMs() - t0) * 16.0; UiPost(d, ui); PrimPost(d); return hr; }
+static HRESULT STDMETHODCALLTYPE hkDIP(IDirect3DDevice9* d, D3DPRIMITIVETYPE t, INT a, UINT b, UINT c, UINT e, UINT f) { R1NoteIfEye(); if (g_fpProbe) FpProbeDraw(d, f, c); const int fpClip = (g_fpHideOn && !g_fpNoCuts) ? FpClipPre(d) : 0; for (int k = 0; k < g_intzN; k++) if (g_curDS == g_intz[k].surf) { g_intz[k].draws++; break; } HPScope _hp(HP_DIP); g_fDraws++; if (g_diagOn || CAPON) RefreshTexState(d); if (g_diagOn) DiagDraw(); if (g_inBandRT) return D3D_OK; OVERLAY_SKIP(); if (PrimPre(d, t, a, b, c, e, f)) return D3D_OK; bool ui = UiPreDraw(d); UI_SKIP(); if (CAPON) { g_da = { 2, t, (UINT)a, b, c, nullptr, 0, e, f, d }; CapDraw(RA, f); PostRec(RA, f); } static unsigned dipN; bool timed = g_prof && (++dipN & 15) == 0; double t0 = timed ? NowMs() : 0; Tweak tw; if (UiTweakPre(d, tw) == TW_RETICLE) ReticleDraws(d, tw, [&] { oDIP(d, t, a, b, c, e, f); }); HRESULT hr = oDIP(d, t, a, b, c, e, f); if (fpClip & 2) { for (int ps = 0; ps < 3; ps++) { FpClipMore(d, ps); oDIP(d, t, a, b, c, e, f); } } if (fpClip & 1) oSetRS(d, D3DRS_CLIPPLANEENABLE, 0); if (fpClip & 4) FpUnbindPlayerTex(d); if (tw.kind) UiTweakPost(d, tw); if (timed) g_s.drawMs += (NowMs() - t0) * 16.0; UiPost(d, ui); PrimPost(d); return hr; }
 static HRESULT STDMETHODCALLTYPE hkDPUP(IDirect3DDevice9* d, D3DPRIMITIVETYPE t, UINT a, const void* p, UINT s) { R1NoteIfEye(); g_fDraws++; if (g_diagOn || CAPON) RefreshTexState(d); if (g_diagOn) DiagDraw(); g_s.drawsUP++; OVERLAY_SKIP(); bool ui = UiPreDraw(d); UI_SKIP(); if (CAPON) { g_da = { 3, t, 0, 0, a, p, s, 0, a, d }; CapDraw(RA, a); PostRec(RA, a); } HRESULT hr = oDPUP(d, t, a, p, s); UiPost(d, ui); return hr; }
 static HRESULT STDMETHODCALLTYPE hkDIPUP(IDirect3DDevice9* d, D3DPRIMITIVETYPE t, UINT a, UINT b, UINT c, const void* i, D3DFORMAT f, const void* v, UINT s) { R1NoteIfEye();
     g_fDraws++; if (g_diagOn || CAPON) RefreshTexState(d); if (g_diagOn) DiagDraw(); g_s.drawsUP++; OVERLAY_SKIP(); bool ui = UiPreDraw(d); UI_SKIP(); if (CAPON) { g_da = { 4, t, a, b, c, v, s, 0, c, d }; CapDraw(RA, c); PostRec(RA, c); } HRESULT hr = oDIPUP(d, t, a, b, c, i, f, v, s); UiPost(d, ui); return hr;
@@ -2200,6 +2231,9 @@ static void FpFindTarget(void* cam, const float* V, const float* P) {
                 {   static bool f3P; const bool f3 = (GetAsyncKeyState(VK_F3) & 0x8000) != 0;   // build 125 (test aid): F3 = body turning on / off
                     if (f3 && !f3P) { if (g_fpTurn < 0) g_fpTurn = 1; g_fpTurn = !g_fpTurn; Log("fp: body turning %s (F3)", g_fpTurn ? "on" : "off"); dxr::ShowMessage(g_fpTurn ? L"Body turning ON" : L"Body turning OFF", 2.0); }
                     f3P = f3; }
+                {   static bool f4P; const bool f4 = (GetAsyncKeyState(VK_F4) & 0x8000) != 0;   // build 130 (test aid): F4 = the mod's per-draw first-person work off / on
+                    if (f4 && !f4P) { g_fpNoCuts = !g_fpNoCuts; Log("fp: per-draw first-person work %s (F4)", g_fpNoCuts ? "off" : "on"); dxr::ShowMessage(g_fpNoCuts ? L"Head cut and turning OFF" : L"Head cut and turning ON", 2.0); }
+                    f4P = f4; }
                 struct Cand { int ptr, off; }; static Cand cand[72]; static int nCand;
                 bool endK = (GetAsyncKeyState(VK_END) & 0x8000) != 0;
                 if (endK && !endP && !g_fpMeasureUntil) {
