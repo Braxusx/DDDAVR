@@ -329,8 +329,16 @@ void ConfigureTracking(const wchar_t* ini) {
 // build 136: the bow's aim point in the world. The game computes it every frame while the bow is in use (ray from its camera
 // along the camera axis: the hit point, or the end of the bow's range) and shoots the arrow from the bow at it (proxy.cpp
 // hkBowTgt). The first-person reticle is drawn at that point, so it shows where the arrow lands at every range.
-static float g_fpAim[3]; static volatile DWORD g_fpAimTick;
-void SetFpAim(const float* t) { memcpy(g_fpAim, t, 12); g_fpAimTick = GetTickCount() | 1; }
+static float g_fpAim[3]; static volatile DWORD g_fpAimTick; static volatile LONG g_fpAimSeq;   // written on a game job thread, read at the camera setup
+void SetFpAim(const float* t) { InterlockedIncrement(&g_fpAimSeq); memcpy(g_fpAim, t, 12); g_fpAimTick = GetTickCount() | 1; InterlockedIncrement(&g_fpAimSeq); }
+// build 137: ages are compared signed. The stamp is "tick | 1" (0 = never), which can lie 1 ms ahead of the clock; unsigned, that
+// read as 49 days old - the reticle fell back to the axis point in about every other frame (seen double), and a bar lost its
+// remembered place for the rest of the frame.
+static bool FpGetAim(float* t) {
+    for (int i = 0; i < 4; i++) { const LONG q = g_fpAimSeq; if (q & 1) continue; const DWORD tk = g_fpAimTick; memcpy(t, g_fpAim, 12);
+        if (g_fpAimSeq == q) return tk && (LONG)(GetTickCount() - tk) < 250; }
+    return false;
+}
 static WORD PadMask(const wchar_t* t) {   // "RB+B" -> XInput button bits; unknown names are ignored, empty / 0 = off
     static const struct { const wchar_t* n; WORD m; } k[] = { { L"UP", 1 }, { L"DOWN", 2 }, { L"LEFT", 4 }, { L"RIGHT", 8 }, { L"START", 0x10 }, { L"BACK", 0x20 },
         { L"LS", 0x40 }, { L"RS", 0x80 }, { L"LB", 0x100 }, { L"RB", 0x200 }, { L"A", 0x1000 }, { L"B", 0x2000 }, { L"X", 0x4000 }, { L"Y", 0x8000 } };
@@ -444,7 +452,7 @@ static bool MatInv(const float* m, float* o) {   // general 4x4 inverse (Gauss-J
 static void MatMulD(const double* a, const double* b, double* o) { for (int i = 0; i < 4; i++) for (int j = 0; j < 4; j++) { double x = 0; for (int k = 0; k < 4; k++) x += a[i * 4 + k] * b[k * 4 + j]; o[i * 4 + j] = x; } }
 static void SyncRecord(const Pose& p, const float* V, const float* P, float s, const float* Pu, float jx, float jy, const float* Mh, float xs0, float ys0) {
     SyncCam c{}; c.pose = p; MatMul(V, P, c.VP);
-    if (Mh) { memcpy(c.Mh, Mh, 64); c.mh = true; } c.fp = g_fpActive; memcpy(c.fpEye, g_fpEye, 12); c.fpSeq = g_fpSeq; memcpy(c.aim, g_fpAim, 12); c.aimOk = g_fpAimTick && GetTickCount() - g_fpAimTick < 250; memcpy(c.Pj, P, 64); c.s = s; c.xs0 = xs0; c.ys0 = ys0;
+    if (Mh) { memcpy(c.Mh, Mh, 64); c.mh = true; } c.fp = g_fpActive; memcpy(c.fpEye, g_fpEye, 12); c.fpSeq = g_fpSeq; c.aimOk = FpGetAim(c.aim); memcpy(c.Pj, P, 64); c.s = s; c.xs0 = xs0; c.ys0 = ys0;
     // right-eye offset in the left eye's view axes (OpenXR head axes: x right, y up, +z back; left-handed game: flip z)
     float dw[3] = { p.posR[0] - p.pos[0], p.posR[1] - p.pos[1], p.posR[2] - p.pos[2] }, dh[3]; Rot(Conj(p.abs), dw, dh);
     { float ipd = sqrtf(dw[0] * dw[0] + dw[1] * dw[1] + dw[2] * dw[2]); if (ipd > 0.04f && ipd < 0.09f) g_ipdM = ipd; }
@@ -587,7 +595,9 @@ bool WorldGuiToEye(int mode, float x, float y, float z, float* X, float* Y, floa
         const float rn = sqrtf(r[0] * r[0] + r[1] * r[1] + r[2] * r[2]), an = rn > 1e-6f ? fabsf(a) / rn : 0;
         float w = (an - 0.15f) / 0.30f; if (w < 0) w = 0; if (w > 1) w = 1;
         const DWORD nowT = GetTickCount(); BarTrk* tk = nullptr;
-        for (auto& e : bt) if (e.tick && nowT - e.tick < 500 && fabsf(e.z - z) < 12.0f && (!tk || fabsf(e.z - z) < fabsf(tk->z - z))) tk = &e;
+        for (auto& e : bt) if (e.tick && (LONG)(nowT - e.tick) < 500 && fabsf(e.z - z) < 12.0f && (!tk || fabsf(e.z - z) < fabsf(tk->z - z))) tk = &e;
+        {   static long nAll, nPrior, nRaw; static DWORD lastL; nAll++; if (w < 0.5f) { if (tk) nPrior++; else nRaw++; }
+            if (nowT - lastL > 10000) { lastL = nowT; if (nAll) Log("fp: name bars - %ld placements in 10 s: %ld with the depth taken from the remembered place, %ld badly conditioned without one", nAll, nPrior, nRaw); nAll = nPrior = nRaw = 0; } }
         if (tk && w < 1) {
             float Wh[3], u[3]; for (int j = 0; j < 3; j++) Wh[j] = tk->W[0] * c.V[j] + tk->W[1] * c.V[4 + j] + tk->W[2] * c.V[8 + j] + c.V[12 + j];   // head view
             for (int j = 0; j < 3; j++) u[j] = Wh[j] - c.Mh[12 + j];   // from the game camera (its place in the head view)
@@ -603,7 +613,7 @@ bool WorldGuiToEye(int mode, float x, float y, float z, float* X, float* Y, floa
             const float f = (l + g_fpBarPush) / l; for (int j = 0; j < 3; j++) pg[j] *= f;
             float pn[3]; for (int j = 0; j < 3; j++) pn[j] = pg[0] * c.Mh[j] + pg[1] * c.Mh[4 + j] + pg[2] * c.Mh[8 + j] + c.Mh[12 + j];
             if (tk || w >= 0.5f) {   // remember where it is in the world (a new bar only from a depth that can be trusted)
-                if (!tk) { tk = &bt[0]; for (auto& e : bt) if (!e.tick || nowT - e.tick >= 500) { tk = &e; break; } else if (e.tick < tk->tick) tk = &e; }
+                if (!tk) { tk = &bt[0]; for (auto& e : bt) if (!e.tick || (LONG)(nowT - e.tick) >= 500) { tk = &e; break; } else if ((LONG)(e.tick - tk->tick) < 0) tk = &e; }
                 for (int j = 0; j < 3; j++) tk->W[j] = pn[0] * c.Vi[j] + pn[1] * c.Vi[4 + j] + pn[2] * c.Vi[8 + j] + c.Vi[12 + j];
                 tk->z = z; tk->tick = nowT | 1; }
             pe[0] = pn[0] + c.V[4] * g_fpBarLift; pe[1] = pn[1] + c.V[5] * g_fpBarLift; pe[2] = pn[2] + c.V[6] * g_fpBarLift;   // world up = row 1 of V
