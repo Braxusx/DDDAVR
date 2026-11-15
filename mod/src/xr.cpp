@@ -298,7 +298,7 @@ static bool g_frameOpen; static XrFrameState g_fs{ XR_TYPE_FRAME_STATE };
 static Q g_refYaw{ 0, 0, 0, 1 }; static float g_refPos[3]; static bool g_refSet, g_wantRef;
 static long g_camCalls, g_camApplied;
 static WORD g_fpPadMask = 0x0280; static float g_fpPadHold = 0.6f; static WORD PadMask(const wchar_t* t);   // build 135: RB + right stick click, held
-static int g_fp, g_autoRecenter = 1; static float g_fpUp, g_fpFwd = 0.0f, g_fpHide = 0.22f, g_fpBarPush = 65.0f, g_fpBarLift = 12.0f, g_fpRetDist = 3000.0f, g_fpEye[3]; static volatile bool g_fpEyeValid, g_fpActive, g_fpLookOk; static float g_fpLook[2]; static volatile long g_fpSeq = -1;   // build 108
+static int g_fp, g_autoRecenter = 1; static float g_fpUp, g_fpFwd = 0.0f, g_fpHide = 0.22f, g_fpBarPush = 65.0f, g_fpBarLift = 5.0f, g_fpRetDist = 3000.0f, g_fpEye[3]; static volatile bool g_fpEyeValid, g_fpActive, g_fpLookOk; static float g_fpLook[2]; static volatile long g_fpSeq = -1;   // build 108
 
 void ConfigureTracking(const wchar_t* ini) {
     g_track = GetPrivateProfileIntW(L"VR", L"HeadTracking", 1, ini);
@@ -316,7 +316,7 @@ void ConfigureTracking(const wchar_t* ini) {
       GetPrivateProfileStringW(L"VR", L"FpForward", L"0.00", u, 32, ini); g_fpFwd = (float)_wtof(u);
       GetPrivateProfileStringW(L"VR", L"FpHide", L"0.22", u, 32, ini); g_fpHide = (float)_wtof(u);
       GetPrivateProfileStringW(L"VR", L"FpBarPush", L"65", u, 32, ini); g_fpBarPush = (float)_wtof(u);
-      GetPrivateProfileStringW(L"VR", L"FpBarLift", L"12", u, 32, ini); g_fpBarLift = (float)_wtof(u);
+      GetPrivateProfileStringW(L"VR", L"FpBarLift", L"5", u, 32, ini); g_fpBarLift = (float)_wtof(u);
       GetPrivateProfileStringW(L"VR", L"FpReticleDist", L"3000", u, 32, ini); g_fpRetDist = (float)_wtof(u); if (g_fpRetDist < 100) g_fpRetDist = 100;
       GetPrivateProfileStringW(L"VR", L"FpPadButtons", L"RB+RS", u, 32, ini); g_fpPadMask = PadMask(u);
       GetPrivateProfileStringW(L"VR", L"FpPadHold", L"0.6", u, 32, ini); g_fpPadHold = (float)_wtof(u); if (g_fpPadHold < 0) g_fpPadHold = 0; if (g_fpPadHold > 5) g_fpPadHold = 5; }
@@ -326,14 +326,11 @@ void ConfigureTracking(const wchar_t* ini) {
 
 // build 108: first person. proxy.cpp finds the game camera's look-at target each frame (SetFpEye); the eye is put there and
 // the view is rebuilt level (the game camera's heading only, world up = +y) before the head pose is applied.
-// build 134: the head centre of the final first-person view and the game camera's own position, in the world (game thread), for
-// the arrow launch (proxy.cpp BowAimFix); FpPadButtons = gamepad combination that switches first / third person
-static float g_fpHeadW[3], g_fpGameCamW[3]; static DWORD g_fpHeadTick;
-bool FpHeadWorld(float* head, float* gameCam) {
-    if (!g_fpActive || GetTickCount() - g_fpHeadTick > 500) return false;
-    memcpy(head, g_fpHeadW, 12); memcpy(gameCam, g_fpGameCamW, 12); return true;
-}
-float FpReticleDist() { return g_fpRetDist; }
+// build 136: the bow's aim point in the world. The game computes it every frame while the bow is in use (ray from its camera
+// along the camera axis: the hit point, or the end of the bow's range) and shoots the arrow from the bow at it (proxy.cpp
+// hkBowTgt). The first-person reticle is drawn at that point, so it shows where the arrow lands at every range.
+static float g_fpAim[3]; static volatile DWORD g_fpAimTick;
+void SetFpAim(const float* t) { memcpy(g_fpAim, t, 12); g_fpAimTick = GetTickCount() | 1; }
 static WORD PadMask(const wchar_t* t) {   // "RB+B" -> XInput button bits; unknown names are ignored, empty / 0 = off
     static const struct { const wchar_t* n; WORD m; } k[] = { { L"UP", 1 }, { L"DOWN", 2 }, { L"LEFT", 4 }, { L"RIGHT", 8 }, { L"START", 0x10 }, { L"BACK", 0x20 },
         { L"LS", 0x40 }, { L"RS", 0x80 }, { L"LB", 0x100 }, { L"RB", 0x200 }, { L"A", 0x1000 }, { L"B", 0x2000 }, { L"X", 0x4000 }, { L"Y", 0x8000 } };
@@ -426,7 +423,7 @@ struct SyncCam { bool valid; float VP[16]; float M[16]; Pose pose;
                  float V[16], VR[16], Vi[16], ViR[16], VPi[16], VPiR[16], camL[3], camR[3];
                  float T[16], Ti[16], Mi[16];
                  double VPu[2][16]; float jx, jy; bool depthInv; long id;
-                 float Mh[16], Pj[16], s, xs0, ys0; bool mh, fp; float fpEye[3]; long fpSeq; };   // build 083: head transform (game view -> left eye view), eye projection, game y scale   // build 075: unjittered per-eye VP, jitter (render px), depth convention   // build 052: eye offset forms for relative substitution   // build 043: all eye-dependent forms
+                 float Mh[16], Pj[16], s, xs0, ys0; bool mh, fp; float fpEye[3]; long fpSeq; float aim[3]; bool aimOk; };   // build 083: head transform (game view -> left eye view), eye projection, game y scale   // build 075: unjittered per-eye VP, jitter (render px), depth convention   // build 052: eye offset forms for relative substitution   // build 043: all eye-dependent forms
 static long g_subN[8];   // per kind: 0 VP, 1 VP^-1, 2 V, 3 V^-1, 4 V^-1 transposed 3x4, 5 camera position (VS), 6 PS forms
 static SyncCam g_cams[4]; static long g_camN; static volatile int g_replayEye = -1; static volatile int g_replayCam = -1;
 static long g_subs, g_subFrames, g_camMatch;
@@ -447,7 +444,7 @@ static bool MatInv(const float* m, float* o) {   // general 4x4 inverse (Gauss-J
 static void MatMulD(const double* a, const double* b, double* o) { for (int i = 0; i < 4; i++) for (int j = 0; j < 4; j++) { double x = 0; for (int k = 0; k < 4; k++) x += a[i * 4 + k] * b[k * 4 + j]; o[i * 4 + j] = x; } }
 static void SyncRecord(const Pose& p, const float* V, const float* P, float s, const float* Pu, float jx, float jy, const float* Mh, float xs0, float ys0) {
     SyncCam c{}; c.pose = p; MatMul(V, P, c.VP);
-    if (Mh) { memcpy(c.Mh, Mh, 64); c.mh = true; } c.fp = g_fpActive; memcpy(c.fpEye, g_fpEye, 12); c.fpSeq = g_fpSeq; memcpy(c.Pj, P, 64); c.s = s; c.xs0 = xs0; c.ys0 = ys0;
+    if (Mh) { memcpy(c.Mh, Mh, 64); c.mh = true; } c.fp = g_fpActive; memcpy(c.fpEye, g_fpEye, 12); c.fpSeq = g_fpSeq; memcpy(c.aim, g_fpAim, 12); c.aimOk = g_fpAimTick && GetTickCount() - g_fpAimTick < 250; memcpy(c.Pj, P, 64); c.s = s; c.xs0 = xs0; c.ys0 = ys0;
     // right-eye offset in the left eye's view axes (OpenXR head axes: x right, y up, +z back; left-handed game: flip z)
     float dw[3] = { p.posR[0] - p.pos[0], p.posR[1] - p.pos[1], p.posR[2] - p.pos[2] }, dh[3]; Rot(Conj(p.abs), dw, dh);
     { float ipd = sqrtf(dw[0] * dw[0] + dw[1] * dw[1] + dw[2] * dw[2]); if (ipd > 0.04f && ipd < 0.09f) g_ipdM = ipd; }
@@ -573,17 +570,42 @@ bool WorldGuiToEye(int mode, float x, float y, float z, float* X, float* Y, floa
         // the game shoots), seen from the first-person eye; the level first-person view does not carry the camera's pitch
         if (!c.fp) return false;
         const float D = g_fpRetDist; pe[0] = s * D * c.Mh[8] + c.Mh[12]; pe[1] = s * D * c.Mh[9] + c.Mh[13]; pe[2] = s * D * c.Mh[10] + c.Mh[14];
+        // build 136: the game's own aim point (where the arrow is sent), when it is known
+        if (c.aimOk) for (int j = 0; j < 3; j++) pe[j] = c.aim[0] * c.V[j] + c.aim[1] * c.V[4 + j] + c.aim[2] * c.V[8 + j] + c.V[12 + j];
     }
     if (c.fp && (mode & 0x100) && g_fpBarPush != 0) {
         // build 115: a pawn's / NPC's name and health bar is placed by the game about 65 units from the head towards its own camera
         // (measured against Rook's tracked head, first and third person: 54..68 along the game camera's ray, about 21 above the
         // head joint). From the third-person camera that shift cannot be seen; from the first-person eye the bar hangs in front of
         // the character. Put it back along that ray and lift it clear of the head.
+        // build 136: the depth along the eye's ray comes from the depth along the GAME camera's axis. When that axis is nearly
+        // square to the ray (the pawn beside you, or the game camera tilted far up or down with the right stick) the equation
+        // hardly fixes it: small errors became tens of units and the bar wandered or shot up. Each bar's last good world place
+        // is kept; the less the equation can say, the more the depth is taken from that place instead (the direction always
+        // comes from this frame).
+        struct BarTrk { float z, W[3]; DWORD tick; }; static BarTrk bt[16];
+        const float rn = sqrtf(r[0] * r[0] + r[1] * r[1] + r[2] * r[2]), an = rn > 1e-6f ? fabsf(a) / rn : 0;
+        float w = (an - 0.15f) / 0.30f; if (w < 0) w = 0; if (w > 1) w = 1;
+        const DWORD nowT = GetTickCount(); BarTrk* tk = nullptr;
+        for (auto& e : bt) if (e.tick && nowT - e.tick < 500 && fabsf(e.z - z) < 12.0f && (!tk || fabsf(e.z - z) < fabsf(tk->z - z))) tk = &e;
+        if (tk && w < 1) {
+            float Wh[3], u[3]; for (int j = 0; j < 3; j++) Wh[j] = tk->W[0] * c.V[j] + tk->W[1] * c.V[4 + j] + tk->W[2] * c.V[8 + j] + c.V[12 + j];   // head view
+            for (int j = 0; j < 3; j++) u[j] = Wh[j] - c.Mh[12 + j];   // from the game camera (its place in the head view)
+            const float ul = sqrtf(u[0] * u[0] + u[1] * u[1] + u[2] * u[2]);
+            if (ul > 1.0f && rn > 1e-6f) {
+                float tp = 0; for (int j = 0; j < 3; j++) tp += (Wh[j] - u[j] / ul * g_fpBarPush) * r[j]; tp /= rn * rn;   // the anchor that belongs to that place, on this ray
+                t = w * t + (1 - w) * tp; pe[0] = r[0] * t; pe[1] = r[1] * t; pe[2] = r[2] * t;
+            }
+        }
         float pg[3]; for (int j = 0; j < 3; j++) pg[j] = pe[0] * Mi[j] + pe[1] * Mi[4 + j] + pe[2] * Mi[8 + j] + Mi[12 + j];   // game view (camera at 0)
         const float l = sqrtf(pg[0] * pg[0] + pg[1] * pg[1] + pg[2] * pg[2]);
         if (l > 1.0f) {
             const float f = (l + g_fpBarPush) / l; for (int j = 0; j < 3; j++) pg[j] *= f;
             float pn[3]; for (int j = 0; j < 3; j++) pn[j] = pg[0] * c.Mh[j] + pg[1] * c.Mh[4 + j] + pg[2] * c.Mh[8 + j] + c.Mh[12 + j];
+            if (tk || w >= 0.5f) {   // remember where it is in the world (a new bar only from a depth that can be trusted)
+                if (!tk) { tk = &bt[0]; for (auto& e : bt) if (!e.tick || nowT - e.tick >= 500) { tk = &e; break; } else if (e.tick < tk->tick) tk = &e; }
+                for (int j = 0; j < 3; j++) tk->W[j] = pn[0] * c.Vi[j] + pn[1] * c.Vi[4 + j] + pn[2] * c.Vi[8 + j] + c.Vi[12 + j];
+                tk->z = z; tk->tick = nowT | 1; }
             pe[0] = pn[0] + c.V[4] * g_fpBarLift; pe[1] = pn[1] + c.V[5] * g_fpBarLift; pe[2] = pn[2] + c.V[6] * g_fpBarLift;   // world up = row 1 of V
         }
     }
@@ -689,10 +711,6 @@ bool ApplyToCamera(float* V, float* P) {
     if (row) { for (int i = 0; i < 4; i++) for (int j = 0; j < 4; j++) { float a = 0; for (int k = 0; k < 4; k++) a += V[i * 4 + k] * M[k * 4 + j]; out[i * 4 + j] = a; } }   // V' = V * M
     else { for (int i = 0; i < 4; i++) for (int j = 0; j < 4; j++) { float a = 0; for (int k = 0; k < 4; k++) a += M[k * 4 + i] * V[k * 4 + j]; out[i * 4 + j] = a; } }    // V' = M^T * V
     memcpy(V, out, sizeof out);
-    if (fpOn && row) {   // build 134: centre of the final view and of the game's own camera in the world (row-vector view: C = -t R^T)
-        for (int j = 0; j < 3; j++) { g_fpHeadW[j] = -(V[12] * V[j * 4] + V[13] * V[j * 4 + 1] + V[14] * V[j * 4 + 2]);
-            g_fpGameCamW[j] = -(gameV[12] * gameV[j * 4] + gameV[13] * gameV[j * 4 + 1] + gameV[14] * gameV[j * 4 + 2]); }
-        g_fpHeadTick = GetTickCount(); }
     if (fpOn && row) {   // build 118: where the head looks, level, in the world (view z axis = column 2; the view looks down -s z)
         float fx = V[2] * (s > 0 ? 1.f : -1.f), fz = V[10] * (s > 0 ? 1.f : -1.f), l = sqrtf(fx * fx + fz * fz);
         if (l > 0.2f) { g_fpLook[0] = fx / l; g_fpLook[1] = fz / l; g_fpLookOk = true; }

@@ -20,8 +20,7 @@ bool ReplayFpEye(float* e);
 void SetFpSeq(long q);
 long ReplayFpSeq();
 bool FpLookDir(float* fx, float* fz);
-bool FpHeadWorld(float* head, float* gameCam);   // build 134: head centre of the first-person view / the game camera, world
-float FpReticleDist();
+void SetFpAim(const float* worldPoint);   // build 136: the bow's aim point (game thread)
 // camera hook: view (cam+0x90) and projection (cam+0xd0) of the main camera, modified in place; true if changed
 bool ApplyToCamera(float* view, float* proj);
 // build 027 UI layer: the transparent shared render target the UI is redirected into (null when not in head-tracking mode)

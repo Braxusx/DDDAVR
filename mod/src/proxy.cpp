@@ -24,10 +24,10 @@ static int g_forceW, g_forceH, g_forceWindowed, g_noVsync, g_noMt;
 static int g_vrW = 3072, g_vrH = 3264;
 // build 094: game version address table. Steam (SteamStub, PE timestamp 0x5a314c31) and GOG (0x5936abab, an older build) have
 // the same functions at different places (found by masked signatures; code identical apart from addresses).
-struct GameAddrs { const char* name; uint32_t ts, camSetup, draw, ctx, sRender, camRectGlobal; const wchar_t* noGlowArc; uint32_t bowAdj; };   // bowAdj: build 134
+struct GameAddrs { const char* name; uint32_t ts, camSetup, draw, ctx, sRender, camRectGlobal; const wchar_t* noGlowArc; uint32_t bowTgt; };   // bowTgt: build 136
 static const GameAddrs kGames[] = {
-    { "Steam", 0x5a314c31, 0xdc1f80, 0xdab480, 0xda6da0, 0x18d08f4, 0x18d0b6c, L"bbsrpg_core_noglow.arc", 0xb1dcb0 },
-    { "GOG",   0x5936abab, 0xdc0700, 0xda9be0, 0xda5530, 0x18b18d4, 0x18b1b4c, L"bbsrpg_core_noglow_gog.arc", 0xb1b2c0 },
+    { "Steam", 0x5a314c31, 0xdc1f80, 0xdab480, 0xda6da0, 0x18d08f4, 0x18d0b6c, L"bbsrpg_core_noglow.arc", 0xb1d010 },
+    { "GOG",   0x5936abab, 0xdc0700, 0xda9be0, 0xda5530, 0x18b18d4, 0x18b1b4c, L"bbsrpg_core_noglow_gog.arc", 0xb1a620 },
 };
 static const GameAddrs* g_game;   // null = unknown version: the game hooks stay off
 #define SRENDER_PTR ((uintptr_t)g_game->sRender)
@@ -2453,44 +2453,24 @@ static void CaptureTick(long lastDraws) {   // called at Present, before the nex
         if (g_devKeys && !autoDone && g_capState == 0 && lastDraws > 3000 && NowMs() - g_startMs > 20000) { autoDone = true; g_capState = 2; Log("capture: automatic (%ld draws last frame)", lastDraws); }
 }
 
-// ---------------------------------------------------------------- build 134: first person - the arrow leaves from the eye
-// The game's bow code (decompile: normal bow projectile setup, Steam 0x00B1D640) launches the player's aimed arrow from the CAMERA
-// position along the camera's axis (origin = camera object +0x40, direction = +0x60 - +0x40), then calls the aim adjustment
-// (0x00B1DCB0: stack = direction pointer + two angles, EDI = the bow action; the origin lies 16 bytes after the direction) and
-// copies both into the projectile. From the third-person camera that line is a point under the reticle. From the first-person
-// eye, 3 m in front of and beside that camera, it is a slanted line: shots at anything nearer than the reticle's distance landed
-// high and to the right. In first person the launch is moved onto the line from the head to the reticle point, so the arrow
-// flies under the reticle at every range. Only these two local vectors of the shot are changed, nothing in the game's objects.
-extern "C" { void* g_oBowAdj = nullptr; void __cdecl BowAimFix(float* dir); void BowAdjDetour(); }
-__asm__(".intel_syntax noprefix\n"
-        ".text\n.globl _BowAdjDetour\n_BowAdjDetour:\n"
-        "  pushad\n  pushfd\n"
-        "  mov eax, [esp+40]\n"            // first stack argument (36 bytes saved + return address)
-        "  mov ebp, esp\n  sub esp, 512\n  and esp, -16\n  fxsave [esp]\n"
-        "  sub esp, 12\n  push eax\n  call _BowAimFix\n  add esp, 16\n"
-        "  fxrstor [esp]\n  mov esp, ebp\n"
-        "  popfd\n  popad\n"
-        "  jmp dword ptr [_g_oBowAdj]\n"
-        ".att_syntax prefix\n");
-static int g_fpArrow = -1;
-extern "C" void __cdecl BowAimFix(float* dir) {
-    if (g_fpArrow < 0) g_fpArrow = GetPrivateProfileIntW(L"VR", L"FpArrowFromEye", 1, g_ini);
-    if (!g_fpArrow || !g_fpHideOnX || !dir) return;
-    float* org = dir + 4; float head[3], cam[3];
-    if (!dxr::FpHeadWorld(head, cam)) return;
-    const float l = sqrtf(dir[0] * dir[0] + dir[1] * dir[1] + dir[2] * dir[2]);
-    if (!(l > 10.0f && l < 5000.0f)) return;   // the camera branch only: its direction is target - position (the hand / joint branches pass unit vectors)
-    const float dc = sqrtf((org[0] - cam[0]) * (org[0] - cam[0]) + (org[1] - cam[1]) * (org[1] - cam[1]) + (org[2] - cam[2]) * (org[2] - cam[2]));
-    if (!(dc < 200.0f)) { static int m; if (m < 6) { m++; Log("fp: arrow not moved - its launch point is %.0f units from the game camera (boom %.0f)", dc, l); } return; }   // and its origin is the game camera
-    const float D = dxr::FpReticleDist();
-    float v[3]; for (int j = 0; j < 3; j++) v[j] = org[j] + dir[j] / l * D - head[j];   // head -> the reticle's point on the camera axis
-    const float lv = sqrtf(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
-    if (!(lv > 100.0f)) return;
-    const float cs = (v[0] * dir[0] + v[1] * dir[1] + v[2] * dir[2]) / (lv * l);
-    static int n; if (n < 12) { n++; Log("fp: arrow launched from the head (camera %.0f %.0f %.0f -> head %.0f %.0f %.0f, %.0f units; direction turned %.2f deg; camera boom %.0f)",
-        org[0], org[1], org[2], head[0], head[1], head[2], sqrtf((org[0] - head[0]) * (org[0] - head[0]) + (org[1] - head[1]) * (org[1] - head[1]) + (org[2] - head[2]) * (org[2] - head[2])),
-        acosf(cs > 1 ? 1 : cs < -1 ? -1 : cs) * 57.2958f, l); }
-    for (int j = 0; j < 3; j++) { org[j] = head[j] + v[j] / lv * 30.0f; dir[j] = v[j] / lv * l; }   // 30 units ahead of the face, same length as before
+// ---------------------------------------------------------------- build 136: first person - the reticle at the bow's aim point
+// From the user's decompile: the bow action's per-frame update (cPlActWpnBow slot 6, Steam 0x00B17940) calls 0x00B1D010 (stdcall,
+// one argument = the bow action). For the player (owner +0x206D bit 1) it casts a ray from the game camera (object +0x40) along
+// the camera axis (+0x60 - +0x40) and stores the hit point - or the end of the bow's range - at action +0x80..+0x88 (+0x78 = set).
+// The shot (0x00B1D640) then flies from the bow towards that point. Read only: the point is handed to the reticle drawing.
+// (Build 134 moved the launch of a camera-origin branch of 0x00B1D640 instead; the player's normal shot never takes that branch -
+// its hook did not fire once - so that change is gone.)
+typedef void(__stdcall* BowTgt_t)(int); static BowTgt_t oBowTgt;
+static void __stdcall hkBowTgt(int self) {
+    oBowTgt(self);
+    if (!g_fpHideOnX || !self) return;
+    const int own = *(int*)(self + 0x58);
+    if (!own || !(*(uint8_t*)(own + 0x206d) & 2) || !*(uint8_t*)(self + 0x78)) return;   // the player's bow, target set
+    const float* t = (const float*)(self + 0x80);
+    if (!(fabsf(t[0]) < 1e7f && fabsf(t[1]) < 1e7f && fabsf(t[2]) < 1e7f)) return;
+    dxr::SetFpAim(t);
+    static DWORD last; const DWORD now = GetTickCount();
+    if (now - last > 10000) { last = now; Log("fp: bow aim point %.0f %.0f %.0f (the reticle is drawn there)", t[0], t[1], t[2]); }
 }
 
 static void Hook(void* target, void* det, void** orig, const char* what) {
@@ -2800,10 +2780,10 @@ static void HookDevice(IDirect3DDevice9* d) {
     if (g_game) {   // build 094: per game version
         Hook((void*)(uintptr_t)g_game->camSetup, (void*)hkCamSetup, (void**)&oCamSetup, "game camera setup");
         Hook((void*)(uintptr_t)g_game->draw, (void*)hkDraw, (void**)&oDraw, "game render-thread draw (stereo replay)");
-        {   // build 134: the bow's aim adjustment (first person: arrow from the eye)
-            static const uint8_t bp[12] = { 0x55, 0x8b, 0xec, 0x83, 0xe4, 0xf0, 0x81, 0xec, 0xd8, 0x00, 0x00, 0x00 };
-            if (g_game->bowAdj && !memcmp((void*)(uintptr_t)g_game->bowAdj, bp, 12)) Hook((void*)(uintptr_t)g_game->bowAdj, (void*)BowAdjDetour, &g_oBowAdj, "bow aim adjustment (first person arrow launch)");
-            else Log("game: bow code not where expected - first person arrows keep the game's launch line"); }
+        {   // build 136: the bow's aim point (first person reticle)
+            static const uint8_t bp[12] = { 0x55, 0x8b, 0xec, 0x83, 0xe4, 0xf0, 0x81, 0xec, 0xc4, 0x01, 0x00, 0x00 };
+            if (g_game->bowTgt && !memcmp((void*)(uintptr_t)g_game->bowTgt, bp, 12)) Hook((void*)(uintptr_t)g_game->bowTgt, (void*)hkBowTgt, (void**)&oBowTgt, "bow aim point (first person reticle)");
+            else Log("game: bow code not where expected - the first person reticle stays on the camera axis"); }
         if (GetPrivateProfileIntW(L"VR", L"R1SkipPrefix", 0, g_ini)) Hook((void*)(uintptr_t)g_game->ctx, (void*)hkCtx, (void**)&oCtx, "game command walker setup (replay 1 prefix skip)");
         {   wchar_t b[32]; GetPrivateProfileStringW(L"VR", L"DrawDistance", L"1", b, 32, g_ini);   // build 095
             float m = (float)_wtof(b); if (!(m >= 1.0f)) m = 1.0f; if (m > 3.0f) m = 3.0f; g_ddViewRange = GetPrivateProfileIntW(L"VR", L"ViewRangeScale", 0, g_ini); DdSet(m);
