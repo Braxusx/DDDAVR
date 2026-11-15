@@ -594,7 +594,8 @@ static void FpTurnRestore(float* tex, int rows, int ti) {
         r.n = 0; }
     g_turnDirtyT[ti] = false; g_fpTurnDirty = g_turnDirtyT[0] || g_turnDirtyT[1] || g_turnDirtyT[2] || g_turnDirtyT[3];
 }
-struct Snap { float tex[16][1024][4]; int rows; long seq; int nEq; int eq[16]; volatile bool ready; }; static Snap g_snap[6]; static Snap* volatile g_snapNew;
+struct Snap { float tex[16][1024][4]; int rows; long seq; int nEq; int eq[16]; volatile bool ready; IDirect3DTexture9* owner; };
+static IDirect3DTexture9* g_btCur; static Snap g_snap[6]; static Snap* volatile g_snapNew;
 // build 124: whose equipment. A worn or carried piece is driven by one of the player's joints, so one of its first bones stays in a
 // fixed relation to one of the player's bones (inverse(player bone) x piece bone is constant) while the player moves; nothing of
 // another character can do that. A piece is the player's once that has held over 60 units of the player's own movement; it is
@@ -665,7 +666,7 @@ static void FpTurnSkeletons(float* tex, int rows, int ti) {
     // build 126: the game's texture is left alone. The frame's bones (first 16 rows) are copied to a snapshot, the player's and the
     // player's equipment's bones are turned in that copy, and the render thread draws the player from it (see FpBindPlayerTex).
     static int which; Snap& sp = g_snap[which = (which + 1) % 6]; sp.ready = false;
-    const int rws = rows < 16 ? rows : 16; memcpy(sp.tex, tex, (size_t)rws * 16384); sp.rows = rws; sp.seq = now; sp.nEq = nEq; for (int i = 0; i < nEq; i++) sp.eq[i] = eq[i].idx;
+    const int rws = rows < 16 ? rows : 16; memcpy(sp.tex, tex, (size_t)rws * 16384); sp.rows = rws; sp.seq = now; sp.owner = g_btCur; sp.nEq = nEq; for (int i = 0; i < nEq; i++) sp.eq[i] = eq[i].idx;
     float* st = (float*)sp.tex;
     float lx, lz;
     if (g_fpTurn && g_turnPath >= 60.0f && dxr::FpLookDir(&lx, &lz)) {
@@ -755,11 +756,11 @@ static void MmUnlock(IDirect3DTexture9* t) {
             DWORD wr; WriteFile(g_boneFile, &h, sizeof h, &wr, nullptr); WriteFile(g_boneFile, m.bits, 4096 * 16, &wr, nullptr); g_boneN++;
         }
         int ti = -1;   // this texture's place among the (three) bone textures
-        if (m.bits && m.w == 1024 && m.h == 64 && m.bpp == 16) { int old = 0; for (int i2 = 0; i2 < 4; i2++) { if (g_tb[i2].t == m.t) { ti = i2; break; } if (g_tb[i2].seq < g_tb[old].seq) old = i2; }
+        if (false && m.bits && m.w == 1024 && m.h == 64 && m.bpp == 16) { int old = 0; for (int i2 = 0; i2 < 4; i2++) { if (g_tb[i2].t == m.t) { ti = i2; break; } if (g_tb[i2].seq < g_tb[old].seq) old = i2; }
             if (ti < 0) { ti = old; g_tb[ti].t = m.t; g_tb[ti].seq = 0; for (int k = 0; k < 17; k++) g_turnRecT[ti][k].n = 0; g_turnDirtyT[ti] = false; }
             InterlockedIncrement(&g_dgUnlock); if (g_dgOrderN < 60) g_dgOrder[g_dgOrderN++] = (char)('A' + ti); }
         if (false && ti >= 0 && g_turnDirtyT[ti] && m.rc.top == 0 && m.rc.left == 0 && m.rc.right >= 1024 && m.pitch == 16384) FpTurnRestore((float*)m.bits, m.rc.bottom < 16 ? (int)m.rc.bottom : 16, ti);
-        if (g_fpWantBones && m.bits && m.w == 1024 && m.h == 64 && m.bpp == 16 && m.rc.top == 0 && m.rc.left == 0 && m.rc.right >= 48 && m.rc.bottom >= 1) {
+        if (false && g_fpWantBones && m.bits && m.w == 1024 && m.h == 64 && m.bpp == 16 && m.rc.top == 0 && m.rc.left == 0 && m.rc.right >= 48 && m.rc.bottom >= 1) {
             memcpy(g_plBone0Raw, m.bits, 48);
             if (g_fpTurn < 0) g_fpTurn = GetPrivateProfileIntW(L"VR", L"FpTurnBody", 1, g_ini);
             if (ti >= 0 && g_fpQok && m.rc.right >= 1024 && m.pitch == 16384) FpTurnSkeletons((float*)m.bits, m.rc.bottom < 16 ? (int)m.rc.bottom : 16, ti);
@@ -773,6 +774,33 @@ static void MmUnlock(IDirect3DTexture9* t) {
                 memcpy(&m.shadow[((size_t)y * m.w + m.rc.left) * m.bpp], (const uint8_t*)m.bits + (size_t)(y - m.rc.top) * m.pitch, (size_t)(m.rc.right - m.rc.left) * m.bpp);
     }
     LeaveCriticalSection(&g_mmCs);
+}
+// build 128: the bone textures. The game does cycle three of them, one locked per frame; the table above (six float textures,
+// first come first served) only ever had room for one, so builds 121-127 saw every third frame: one frame in three was turned
+// (the "second body"), and from 126 the body advanced at a third of the frame rate (the stutter). Each gets its own entry here.
+struct BoneTex { IDirect3DTexture9* t; void* bits; int rows; bool locked; long seq; const Snap* snap; };
+static BoneTex g_bt[4]; static volatile bool g_btAny; extern IDirect3DTexture9* g_fpA2X;
+static void BtLock(IDirect3DTexture9* t, D3DLOCKED_RECT* lr, const RECT* rc) {
+    if (lr->Pitch != 16384 || t == g_fpA2X) return;
+    BoneTex* e = nullptr; for (int i = 0; i < 4; i++) if (g_bt[i].t == t) { e = &g_bt[i]; break; }
+    if (!e) { D3DSURFACE_DESC d; if (FAILED(t->GetLevelDesc(0, &d)) || d.Width != 1024 || d.Height != 64 || d.Format != D3DFMT_A32B32G32R32F) return;
+        e = &g_bt[0]; int n = 0; for (int i = 0; i < 4; i++) { if (g_bt[i].t) n++; if (g_bt[i].seq < e->seq || !g_bt[i].t) { e = &g_bt[i]; if (!g_bt[i].t) break; } }
+        *e = {}; e->t = t; Log("fp: bone texture %p (%d known before)", t, n); }
+    if (rc && (rc->left != 0 || rc->top != 0 || rc->right < 1024 || rc->bottom < 1)) { e->locked = false; return; }
+    e->bits = lr->pBits; e->rows = rc ? (int)rc->bottom : 64; e->locked = true; g_btAny = true;
+}
+static void BtUnlock(IDirect3DTexture9* t) {
+    BoneTex* e = nullptr; for (int i = 0; i < 4; i++) if (g_bt[i].t == t && g_bt[i].locked) { e = &g_bt[i]; break; }
+    if (!e) return;
+    e->locked = false; InterlockedIncrement(&g_dgUnlock);
+    if (!g_fpWantBones || !e->bits) return;
+    memcpy(g_plBone0Raw, e->bits, 48);
+    if (g_fpTurn < 0) g_fpTurn = GetPrivateProfileIntW(L"VR", L"FpTurnBody", 1, g_ini);
+    const Snap* before = g_snapNew; g_btCur = t;
+    if (g_fpQok) FpTurnSkeletons((float*)e->bits, e->rows < 16 ? e->rows : 16, 0);
+    const Snap* sn2 = g_snapNew; const bool made = sn2 && sn2->ready && sn2->owner == t && sn2->seq == g_camSeq && (sn2 != before || true);
+    if (made) e->snap = sn2;
+    memcpy(g_plBone, made ? (const void*)sn2->tex : (const void*)e->bits, sizeof g_plBone); memcpy(g_plBoneRoot, g_fpRoot, 12); g_plBoneSeq = g_camSeq; e->seq = g_camSeq;
 }
 static void MmSave() {
     EnterCriticalSection(&g_mmCs);
@@ -811,7 +839,7 @@ static IDirect3DBaseTexture9* g_fpPrevTex; static DWORD g_fpPrevSamp; static vol
 // build 127: the snapshot that belongs to the camera being drawn. Frame numbers did not line up (126 never found a match and fell
 // back to the newest, so the body ran a varying one or two frames ahead of the camera - the stutter). Now: the snapshot whose
 // head is nearest to the eye point that camera was built with.
-static volatile long g_dgAge[6], g_dgDeclYes, g_dgDeclNo; static volatile bool g_declCheck = true;
+static volatile long g_dgAge[6], g_dgDeclYes, g_dgDeclNo, g_dgTexHit, g_dgTexMiss; static volatile bool g_declCheck = false;
 static const Snap* FpSnapNow() {
     static const Snap* last; static long lastKey = -2; static int lastRep = -2;
     const long key = dxr::ReplayFpSeq(); if (key == lastKey && g_replay == lastRep && last && last->ready) return last;
@@ -853,7 +881,15 @@ static int FpClipPre(IDirect3DDevice9* d) {
     const int tx = (int)(sk[1] * 1024.0f + 0.5f), ty = (int)(sk[2] * 64.0f + 0.5f);
     if (tx < 0 || tx > 1021 || ty < 0 || ty > 15) return 0;
     const int idx = ty * 1024 + tx; g_slotSeen[idx] = (uint16_t)g_camSeq;
-    const Snap* S = FpSnapNow(); if (!S) return 0;
+    const Snap* S = nullptr;
+    {   // build 128: the snapshot made from the very texture this draw has bound - camera, world and body from one frame
+        IDirect3DBaseTexture9* bt = nullptr;
+        if (SUCCEEDED(d->GetTexture(D3DVERTEXTEXTURESAMPLER0 + v->samp, &bt)) && bt) {
+            for (int i = 0; i < 4; i++) if ((void*)g_bt[i].t == (void*)bt) { const Snap* q = g_bt[i].snap; if (q && q->ready && (void*)q->owner == (void*)bt) S = q; break; }
+            bt->Release(); }
+        if (S) InterlockedIncrement(&g_dgTexHit); else { InterlockedIncrement(&g_dgTexMiss); S = FpSnapNow(); }
+    }
+    if (!S) return 0;
     {   // build 127: a draw without bone indices in its vertex format is not a skinned mesh, whatever its shader's constants hold (grass
         // and the like were being taken for the player through a leftover constant, cut at the neck plane and given the player's bones)
         struct DeclC { IDirect3DVertexDeclaration9* d; bool skinned; }; static DeclC dc[64]; static int dn;
@@ -2131,11 +2167,9 @@ static void FpFindTarget(void* cam, const float* V, const float* P) {
                 }
                 g_fpHideOn = ok && dxr::FirstPerson(); g_fpWantBones = g_fpHideOn; g_fpRootOk = ok; InterlockedIncrement(&g_camSeq); dxr::SetFpSeq(g_camSeq);
                 { static DWORD lastD; if (g_fpHideOn && nowT - lastD > 10000) { lastD = nowT;
-                    {   const long dy = InterlockedExchange(&g_dgDeclYes, 0), dn2 = InterlockedExchange(&g_dgDeclNo, 0);
-                        if (g_declCheck && dy == 0 && dn2 > 2000) { g_declCheck = false; Log("fp: the player's meshes carry no bone-index vertex element - that test is switched off"); }
-                        Log("fp: diag - draws claiming the player's skeleton: %ld with bone indices in the vertex format, %ld without (%s)", dy, dn2, g_declCheck ? "left to the game" : "accepted"); }
-                    Log("fp: diag - %ld bone-texture unlocks, %ld player/equipment draws from the mod's bone texture; snapshot chosen was 0:%ld 1:%ld 2:%ld 3:%ld 4:%ld 5+:%ld camera frames old",
-                        InterlockedExchange(&g_dgUnlock, 0), InterlockedExchange(&g_dgBound, 0), InterlockedExchange(&g_dgAge[0], 0), InterlockedExchange(&g_dgAge[1], 0), InterlockedExchange(&g_dgAge[2], 0), InterlockedExchange(&g_dgAge[3], 0), InterlockedExchange(&g_dgAge[4], 0), InterlockedExchange(&g_dgAge[5], 0)); g_dgOrderN = 0; } }
+                    InterlockedExchange(&g_dgDeclYes, 0); InterlockedExchange(&g_dgDeclNo, 0);
+                    Log("fp: diag - %ld bone-texture unlocks, %ld player/equipment draws from the mod's bone texture; snapshot taken from the bound texture %ld times, guessed %ld times",
+                        InterlockedExchange(&g_dgUnlock, 0), InterlockedExchange(&g_dgBound, 0), InterlockedExchange(&g_dgTexHit, 0), InterlockedExchange(&g_dgTexMiss, 0)); g_dgOrderN = 0; } }
                 { static DWORD lastC; if (g_fpHideOn && nowT - lastC > 10000) { lastC = nowT; Log("fp: own-body cut used on %ld draws, carried-equipment cut on %ld draws in the last 10 s", InterlockedExchange(&g_fpClipped, 0), InterlockedExchange(&g_fpClippedEq, 0)); } }
                 if ((int)ok != state) { state = ok; Log("fp: %s (camera class %p, distance %.0f)", ok ? "character found under the camera target - first person available" : "no character under the camera target - first person paused", *(void* const*)o, dist); }
             }
@@ -2415,6 +2449,7 @@ static void VigWrite(VigCand& c, bool clear) {
 static HRESULT STDMETHODCALLTYPE hkTexLock(IDirect3DTexture9* t, UINT lv, D3DLOCKED_RECT* lr, const RECT* rc, DWORD fl) {
     HRESULT hr = oTexLock(t, lv, lr, rc, fl);
     if ((g_fpProbe || g_boneRec || g_fpWantBones || g_fpTurnDirty) && SUCCEEDED(hr) && lv == 0 && lr && !(fl & D3DLOCK_READONLY)) MmLock(t, lr, rc, fl);   // build 110
+    if (g_fpWantBones && SUCCEEDED(hr) && lv == 0 && lr && !(fl & D3DLOCK_READONLY)) BtLock(t, lr, rc);   // build 128
     if (SUCCEEDED(hr) && lv == 0 && !rc && lr && !(fl & D3DLOCK_READONLY)) {
         EnterCriticalSection(&g_vigCs);
         if (VigCand* c = VigFind(t)) { c->bits = lr->pBits; c->pitch = lr->Pitch; }
@@ -2424,6 +2459,7 @@ static HRESULT STDMETHODCALLTYPE hkTexLock(IDirect3DTexture9* t, UINT lv, D3DLOC
 }
 static HRESULT STDMETHODCALLTYPE hkTexUnlock(IDirect3DTexture9* t, UINT lv) {
     if (lv == 0 && g_mmN) MmUnlock(t);   // build 110
+    if (lv == 0 && g_btAny) BtUnlock(t);   // build 128
     if (lv == 0) {
         EnterCriticalSection(&g_vigCs);
         VigCand* c = VigFind(t);
