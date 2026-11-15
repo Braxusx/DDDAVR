@@ -424,10 +424,12 @@ static void ReleaseQueries() {
         g_qDis[i] = g_qFreq[i] = g_qBeg[i] = g_qEnd[i] = nullptr; g_ringValid[i] = 0;
     }
 }
+IDirect3DTexture9* g_fpA2X; volatile long g_fpA2SeqX = -1;   // build 126: the mod's own bone texture for the player (default pool: released on reset)
 static HRESULT STDMETHODCALLTYPE hkReset(IDirect3DDevice9* d, D3DPRESENT_PARAMETERS* p) {
     LogPP("reset (game)", p);
     ApplyOverrides(p);
     ReleaseQueries();
+    if (g_fpA2X) { g_fpA2X->Release(); g_fpA2X = nullptr; g_fpA2SeqX = -1; }
     HRESULT hr = oReset(d, p);
     Log("reset -> 0x%08lx", (unsigned long)hr);
     return hr;
@@ -592,6 +594,7 @@ static void FpTurnRestore(float* tex, int rows, int ti) {
         r.n = 0; }
     g_turnDirtyT[ti] = false; g_fpTurnDirty = g_turnDirtyT[0] || g_turnDirtyT[1] || g_turnDirtyT[2] || g_turnDirtyT[3];
 }
+struct Snap { float tex[16][1024][4]; int rows; long seq; int nEq; int eq[16]; volatile bool ready; }; static Snap g_snap[3]; static Snap* volatile g_snapNew;
 // build 124: whose equipment. A worn or carried piece is driven by one of the player's joints, so one of its first bones stays in a
 // fixed relation to one of the player's bones (inverse(player bone) x piece bone is constant) while the player moves; nothing of
 // another character can do that. A piece is the player's once that has held over 60 units of the player's own movement; it is
@@ -600,7 +603,7 @@ static void FpTurnRestore(float* tex, int rows, int ti) {
 struct Trk { int idx; bool owned, refOk; int nb; uint64_t alive[4]; float ref[4][48][12]; float path, bad; int away; long seq; };
 static Trk g_trk[20]; static float g_trkRoot[3], g_trkPsi; static float g_turnPath; static bool g_trkInit;
 static void FpTurnSkeletons(float* tex, int rows, int ti) {
-    g_turnRec = g_turnRecT[ti];
+    (void)ti;
     const long now = g_camSeq; const int lim = rows * 1024;
     const float psi = atan2f(tex[2], tex[10]);
     float step = 0; if (g_trkInit) { const float a = g_fpRoot[0] - g_trkRoot[0], b = g_fpRoot[1] - g_trkRoot[1], c2 = g_fpRoot[2] - g_trkRoot[2]; step = sqrtf(a * a + b * b + c2 * c2); if (step > 60) step = 0;
@@ -649,28 +652,34 @@ static void FpTurnSkeletons(float* tex, int rows, int ti) {
         if (t->idx && t->owned && nEq < 16) eq[nEq++] = { idx, now };
     }
     for (int i = 0; i < 16; i++) g_eqSlot[i] = i < nEq ? eq[i] : EqSlot{ 0, 0 };
-    if (!g_fpTurn || g_turnPath < 60.0f) return;
-    float lx, lz; if (!dxr::FpLookDir(&lx, &lz)) return;
-    const float fx = tex[2], fz = tex[10], fl = sqrtf(fx * fx + fz * fz); if (!(fl > 20)) return;   // player bone 0, packed +z = forward
-    float dd = atan2f(lx, lz) - atan2f(fx, fz); while (dd > 3.14159265f) dd -= 6.2831853f; while (dd < -3.14159265f) dd += 6.2831853f;
-    const float c = cosf(dd), sn = sinf(dd), cx = g_fpRoot[0], cz = g_fpRoot[2];
-    for (int k = 0; k < 17; k++) {
-        int idx, cap;
-        if (k == 0) { idx = 0; cap = 96; }
-        else { const EqSlot& e = g_eqSlot[k - 1]; if (e.idx <= 0) continue; idx = e.idx; cap = 24; }
-        const int rowEnd = (idx / 1024 + 1) * 1024;   // a skeleton does not run past the end of its row (122 ran into the next row's first skeleton)
-        if (idx + 3 > lim || idx + 3 > rowEnd) continue;
-        int n = 1; while (n < cap && idx + (n + 1) * 3 <= rowEnd && idx + (n + 1) * 3 <= lim && (uint16_t)((uint16_t)now - g_slotSeen[idx + n * 3]) >= 4) n++;   // up to the next skeleton drawn
-        if (k == 0) { static int plN = 48; if (n < cap) plN = n; n = plN; if (idx + n * 3 > lim) continue; }   // the player: the count once seen, 48 until then
-        TurnRec& r = g_turnRec[k]; r.idx = idx; r.n = n;
-        for (int i = 0; i < n; i++) {
-            float* r0 = tex + (idx + i * 3) * 4; float* r2 = r0 + 8; memcpy(r.raw[i], r0, 48);
-            for (int j = 0; j < 3; j++) { const float a = r0[j], b = r2[j]; r0[j] = c * a + sn * b; r2[j] = -sn * a + c * b; }
-            const float tx = r0[3] - cx, tz = r2[3] - cz; r0[3] = c * tx + sn * tz + cx; r2[3] = -sn * tx + c * tz + cz;
-            memcpy(r.wr[i], r0, 48);
+    // build 126: the game's texture is left alone. The frame's bones (first 16 rows) are copied to a snapshot, the player's and the
+    // player's equipment's bones are turned in that copy, and the render thread draws the player from it (see FpBindPlayerTex).
+    static int which; Snap& sp = g_snap[which = (which + 1) % 3]; sp.ready = false;
+    const int rws = rows < 16 ? rows : 16; memcpy(sp.tex, tex, (size_t)rws * 16384); sp.rows = rws; sp.seq = now; sp.nEq = nEq; for (int i = 0; i < nEq; i++) sp.eq[i] = eq[i].idx;
+    float* st = (float*)sp.tex;
+    float lx, lz;
+    if (g_fpTurn && g_turnPath >= 60.0f && dxr::FpLookDir(&lx, &lz)) {
+        const float fx = st[2], fz = st[10], fl = sqrtf(fx * fx + fz * fz);   // player bone 0, packed +z = forward
+        if (fl > 20) {
+            float dd = atan2f(lx, lz) - atan2f(fx, fz); while (dd > 3.14159265f) dd -= 6.2831853f; while (dd < -3.14159265f) dd += 6.2831853f;
+            const float c = cosf(dd), sn = sinf(dd), cx = g_fpRoot[0], cz = g_fpRoot[2]; const int lim2 = rws * 1024;
+            for (int k = 0; k < 17; k++) {
+                int idx, cap;
+                if (k == 0) { idx = 0; cap = 96; }
+                else { const EqSlot& e = g_eqSlot[k - 1]; if (e.idx <= 0) continue; idx = e.idx; cap = 24; }
+                const int rowEnd = (idx / 1024 + 1) * 1024;   // a skeleton does not run past the end of its row
+                if (idx + 3 > lim2 || idx + 3 > rowEnd) continue;
+                int n = 1; while (n < cap && idx + (n + 1) * 3 <= rowEnd && idx + (n + 1) * 3 <= lim2 && (uint16_t)((uint16_t)now - g_slotSeen[idx + n * 3]) >= 4) n++;   // up to the next skeleton drawn
+                if (k == 0) { static int plN = 48; if (n < cap) plN = n; n = plN; if (idx + n * 3 > lim2) continue; }   // the player: the count once seen, 48 until then
+                for (int i = 0; i < n; i++) {
+                    float* r0 = st + (idx + i * 3) * 4; float* r2 = r0 + 8;
+                    for (int j = 0; j < 3; j++) { const float a = r0[j], b = r2[j]; r0[j] = c * a + sn * b; r2[j] = -sn * a + c * b; }
+                    const float tx = r0[3] - cx, tz = r2[3] - cz; r0[3] = c * tx + sn * tz + cx; r2[3] = -sn * tx + c * tz + cz;
+                }
+            }
         }
-        g_turnDirtyT[ti] = true; g_fpTurnDirty = true;
     }
+    sp.ready = true; g_snapNew = &sp;
 }
 static const float kFpEyeUp = 9.0f, kFpEyeFwd = 8.0f;   // eyes from the head joint, game units
 static bool FpHeadFrame(const float* S, float* J, float* U, float* F) {   // S = 3 rows of 4: world = A q + T
@@ -739,12 +748,13 @@ static void MmUnlock(IDirect3DTexture9* t) {
         if (m.bits && m.w == 1024 && m.h == 64 && m.bpp == 16) { int old = 0; for (int i2 = 0; i2 < 4; i2++) { if (g_tb[i2].t == m.t) { ti = i2; break; } if (g_tb[i2].seq < g_tb[old].seq) old = i2; }
             if (ti < 0) { ti = old; g_tb[ti].t = m.t; g_tb[ti].seq = 0; for (int k = 0; k < 17; k++) g_turnRecT[ti][k].n = 0; g_turnDirtyT[ti] = false; }
             InterlockedIncrement(&g_dgUnlock); if (g_dgOrderN < 60) g_dgOrder[g_dgOrderN++] = (char)('A' + ti); }
-        if (ti >= 0 && g_turnDirtyT[ti] && m.rc.top == 0 && m.rc.left == 0 && m.rc.right >= 1024 && m.pitch == 16384) FpTurnRestore((float*)m.bits, m.rc.bottom < 16 ? (int)m.rc.bottom : 16, ti);
+        if (false && ti >= 0 && g_turnDirtyT[ti] && m.rc.top == 0 && m.rc.left == 0 && m.rc.right >= 1024 && m.pitch == 16384) FpTurnRestore((float*)m.bits, m.rc.bottom < 16 ? (int)m.rc.bottom : 16, ti);
         if (g_fpWantBones && m.bits && m.w == 1024 && m.h == 64 && m.bpp == 16 && m.rc.top == 0 && m.rc.left == 0 && m.rc.right >= 48 && m.rc.bottom >= 1) {
             memcpy(g_plBone0Raw, m.bits, 48);
             if (g_fpTurn < 0) g_fpTurn = GetPrivateProfileIntW(L"VR", L"FpTurnBody", 1, g_ini);
             if (ti >= 0 && g_fpQok && m.rc.right >= 1024 && m.pitch == 16384) FpTurnSkeletons((float*)m.bits, m.rc.bottom < 16 ? (int)m.rc.bottom : 16, ti);
-            memcpy(g_plBone, m.bits, sizeof g_plBone); memcpy(g_plBoneRoot, g_fpRoot, 12); g_plBoneSeq = g_camSeq;
+            {   const Snap* sn2 = g_snapNew; const void* src = (sn2 && sn2->ready && sn2->seq == g_camSeq) ? (const void*)sn2->tex : (const void*)m.bits;
+                memcpy(g_plBone, src, sizeof g_plBone); memcpy(g_plBoneRoot, g_fpRoot, 12); g_plBoneSeq = g_camSeq; }
             if (ti >= 0) { TexBones* e = &g_tb[ti]; memcpy(e->b, m.bits, sizeof e->b); e->seq = g_camSeq; }
             if (m.pitch == 16384) { const int rows = m.rc.bottom < 16 ? (int)m.rc.bottom : 16; memcpy(g_boneTex, m.bits, (size_t)rows * 16384); g_boneTexOk = true; }
         }
@@ -785,46 +795,63 @@ static void FpProbeDraw(IDirect3DDevice9* d, UINT prims, UINT verts) {
 volatile bool g_fpHideOnX; static volatile bool& g_fpHideOn = g_fpHideOnX; static volatile long g_fpClipped, g_fpClippedEq;
 static HRESULT FpSetRS(IDirect3DDevice9* d, D3DRENDERSTATETYPE st, DWORD v);
 static float g_fpPlB[2][4];
+extern IDirect3DTexture9* g_fpA2X; extern volatile long g_fpA2SeqX;
+static HRESULT FpTexLockRaw(IDirect3DTexture9* t, D3DLOCKED_RECT* lr, DWORD fl); static HRESULT FpTexUnlockRaw(IDirect3DTexture9* t);
+static IDirect3DBaseTexture9* g_fpPrevTex; static DWORD g_fpPrevSamp; static volatile long g_dgBound, g_dgSnapMatch, g_dgSnapOther;
+// build 126: the snapshot that belongs to the camera frame being drawn (else the newest)
+static const Snap* FpSnapNow() {
+    const long want = dxr::ReplayFpSeq(); const Snap* best = nullptr;
+    for (int i = 0; i < 3; i++) { const Snap* q = &g_snap[i]; if (!q->ready) continue; if (q->seq == want) return q; if (!best || q->seq > best->seq) best = q; }
+    if (best && g_camSeq - best->seq > 6) return nullptr;   // stale (first person was off): let the game draw as it is
+    return best;
+}
+// build 126: the player's (and the player's equipment's) draws read their bones from the mod's own texture, filled from that
+// snapshot. The game's own bone texture reaches the screen through a second texture at a moment the mod does not control, so
+// turning it in place gave pictures from half-turned data (the "second body").
+static bool FpBindPlayerTex(IDirect3DDevice9* d, int samp, const Snap* S) {
+    if (!g_fpA2X) { static bool failed; if (failed) return false;
+        if (FAILED(d->CreateTexture(1024, 64, 1, D3DUSAGE_DYNAMIC, D3DFMT_A32B32G32R32F, D3DPOOL_DEFAULT, &g_fpA2X, nullptr)) || !g_fpA2X) { failed = true; g_fpA2X = nullptr; Log("fp: could not create the player's bone texture - body turning unavailable"); return false; }
+        g_fpA2SeqX = -1; Log("fp: player bone texture created"); }
+    if (g_fpA2SeqX != S->seq) {
+        D3DLOCKED_RECT lr; if (FAILED(FpTexLockRaw(g_fpA2X, &lr, D3DLOCK_DISCARD)) || !lr.pBits) return false;
+        for (int r = 0; r < S->rows; r++) memcpy((uint8_t*)lr.pBits + (size_t)r * lr.Pitch, S->tex[r], 16384);
+        FpTexUnlockRaw(g_fpA2X); g_fpA2SeqX = S->seq;
+        if (S->seq == dxr::ReplayFpSeq()) InterlockedIncrement(&g_dgSnapMatch); else InterlockedIncrement(&g_dgSnapOther);
+    }
+    g_fpPrevTex = nullptr; g_fpPrevSamp = D3DVERTEXTEXTURESAMPLER0 + samp;
+    if (FAILED(d->GetTexture(g_fpPrevSamp, &g_fpPrevTex))) g_fpPrevTex = nullptr;
+    d->SetTexture(g_fpPrevSamp, g_fpA2X); InterlockedIncrement(&g_dgBound);
+    return true;
+}
+static void FpUnbindPlayerTex(IDirect3DDevice9* d) { d->SetTexture(g_fpPrevSamp, g_fpPrevTex); if (g_fpPrevTex) { g_fpPrevTex->Release(); g_fpPrevTex = nullptr; } }
+// returns bits: 1 = clip plane on, 2 = second pass wanted, 4 = own bone texture bound
 static int FpClipPre(IDirect3DDevice9* d) {
     const FpVsInfo* v = FpVs(g_curVS);
     if (!v || v->samp < 0 || v->skinReg < 0 || v->skinReg >= 64) return 0;
     const float* sk = g_vsLow[v->skinReg];
     if (sk[0] <= 0.0f) return 0;
-    {   const int tx = (int)(sk[1] * 1024.0f + 0.5f), ty = (int)(sk[2] * 64.0f + 0.5f); if (tx >= 0 && tx < 1024 && ty >= 0 && ty < 16) g_slotSeen[ty * 1024 + tx] = (uint16_t)g_camSeq; }
-    if (v->shadow) return 0;
-    const float (*pb)[12] = g_plBone; long pbSeq = g_plBoneSeq;
-    bool texFound = false;
-    {   IDirect3DBaseTexture9* bt = nullptr; if (SUCCEEDED(d->GetTexture(D3DVERTEXTEXTURESAMPLER0 + v->samp, &bt)) && bt) { for (int i = 0; i < 4; i++) if ((void*)g_tb[i].t == (void*)bt) { pb = g_tb[i].b; pbSeq = g_tb[i].seq; texFound = true; break; } bt->Release(); } }
-    if (sk[1] == 0.0f && sk[2] == 0.0f) {   // the player's draws
-        static long seq0 = -1, counted = -1, frameSeq = -1;
-        if (!texFound) InterlockedIncrement(&g_dgNoTex);
-        else if (g_replay == 0) { if (pbSeq != frameSeq) { frameSeq = pbSeq; seq0 = pbSeq; InterlockedIncrement(&g_dgFrames); long dp = g_camSeq - pbSeq; if (dp < 0) dp = 0; if (dp > 5) dp = 5; InterlockedIncrement(&g_dgDepth[dp]); } }
-        else if (g_replay == 1 && pbSeq != seq0 && counted != pbSeq) { counted = pbSeq; InterlockedIncrement(&g_dgEyeMis); }
-    }
-    if (sk[1] != 0.0f || sk[2] != 0.0f) {
-        // build 119: another skeleton. Equipment carried by the player (bow, quiver, shield, sheathed weapons: small models,
-        // bone scale under 200 where characters have 240 and more, sitting on the player) is not drawn behind the chest's back
-        // plane - so it is hidden while on the back and shows once it is in the hands.
+    const int tx = (int)(sk[1] * 1024.0f + 0.5f), ty = (int)(sk[2] * 64.0f + 0.5f);
+    if (tx < 0 || tx > 1021 || ty < 0 || ty > 15) return 0;
+    const int idx = ty * 1024 + tx; g_slotSeen[idx] = (uint16_t)g_camSeq;
+    const Snap* S = FpSnapNow(); if (!S) return 0;
+    const bool player = idx == 0; bool mine = player; for (int i = 0; i < S->nEq && !mine; i++) mine = S->eq[i] == idx;
+    if (!mine) return 0;
+    int rc = FpBindPlayerTex(d, v->samp, S) ? 4 : 0;
+    if (v->shadow) return rc;
+    const float (*pb)[12] = (const float (*)[12])S->tex;   // the player's bones in that snapshot
+    float J[3], U[3], F[3];
+    if (!player) {
+        // build 119: equipment carried by the player is not drawn behind the chest's back plane - hidden on the back, shown in the hands
         if (g_fpHideBack < 0) g_fpHideBack = GetPrivateProfileIntW(L"VR", L"FpHideBack", 1, g_ini);
-        if (!g_fpQok || !g_boneTexOk) return 0;
-        const int tx = (int)(sk[1] * 1024.0f + 0.5f), ty = (int)(sk[2] * 64.0f + 0.5f);
-        if (tx < 0 || tx > 1021 || ty < 0 || ty > 15) return 0;
-        {   const int idx = ty * 1024 + tx; bool mine = false; for (int i = 0; i < 16 && !mine; i++) mine = g_eqSlot[i].idx == idx; if (!mine) return 0; }
-        if (!g_fpHideBack) return 0;
-        float J[3], U[3], F[3]; if (!FpHeadFrame(pb[15], J, U, F)) return 0;
+        if (!g_fpHideBack || !g_fpQok || !FpHeadFrame(pb[15], J, U, F)) return rc;
         const float* C = pb[13]; float cf[3] = { C[2], C[6], C[10] }; const float cl = sqrtf(cf[0] * cf[0] + cf[1] * cf[1] + cf[2] * cf[2]);   // chest forward
         if (cl > 20) { cf[0] /= cl; cf[1] /= cl; cf[2] /= cl; } else memcpy(cf, F, 12);
         const float w[4] = { cf[0], cf[1], cf[2], -(cf[0] * J[0] + cf[1] * J[1] + cf[2] * J[2]) + 6.0f }; float cp[4];
-        if (!dxr::WorldPlaneToClip(w, cp)) return 0;
+        if (!dxr::WorldPlaneToClip(w, cp)) return rc;
         d->SetClipPlane(0, cp); FpSetRS(d, D3DRS_CLIPPLANEENABLE, D3DCLIPPLANE0); InterlockedIncrement(&g_fpClippedEq);
-        return 1;
+        return rc | 1;
     }
-    float J[3], U[3], F[3];
     if (g_fpQok && FpHeadFrame(pb[15], J, U, F)) {
-        static long mSeq = -1; const long bs = pbSeq;
-        if (g_replay == 0 && bs != mSeq) {   // once per skeleton frame: the drawn head's eye point against the camera's eye point
-            float e[3]; if (dxr::ReplayFpEye(e)) { mSeq = bs; for (int i = 0; i < 3; i++) g_fpLagD[i] = J[i] + U[i] * kFpEyeUp + F[i] * kFpEyeFwd - e[i]; InterlockedIncrement(&g_fpLagN); }
-        }
         // pass A: everything below the neck. Pass B (FpClipSecond): above the neck only what is well in front of the face (raised hands, weapons)
         const float Pn[3] = { J[0] - U[0] * 4.0f, J[1] - U[1] * 4.0f, J[2] - U[2] * 4.0f }, Pf[3] = { J[0] + F[0] * 24.0f, J[1] + F[1] * 24.0f, J[2] + F[2] * 24.0f };
         const float un = U[0] * Pn[0] + U[1] * Pn[1] + U[2] * Pn[2];
@@ -832,12 +859,12 @@ static int FpClipPre(IDirect3DDevice9* d) {
         float cA[4];
         if (dxr::WorldPlaneToClip(wA, cA) && dxr::WorldPlaneToClip(wB1, g_fpPlB[0]) && dxr::WorldPlaneToClip(wB2, g_fpPlB[1])) {
             d->SetClipPlane(0, cA); FpSetRS(d, D3DRS_CLIPPLANEENABLE, D3DCLIPPLANE0); InterlockedIncrement(&g_fpClipped);
-            return 2;
+            return rc | 3;
         }
     }
-    float pl[4]; if (!dxr::FpClipPlane(pl)) return 0;
+    float pl[4]; if (!dxr::FpClipPlane(pl)) return rc;
     d->SetClipPlane(0, pl); FpSetRS(d, D3DRS_CLIPPLANEENABLE, D3DCLIPPLANE0); InterlockedIncrement(&g_fpClipped);
-    return 1;
+    return rc | 1;
 }
 static void FpClipSecond(IDirect3DDevice9* d) { d->SetClipPlane(0, g_fpPlB[0]); d->SetClipPlane(1, g_fpPlB[1]); FpSetRS(d, D3DRS_CLIPPLANEENABLE, D3DCLIPPLANE0 | D3DCLIPPLANE1); }
 
@@ -1736,7 +1763,7 @@ template <class F> static void ReticleDraws(IDirect3DDevice9* d, const Tweak& tw
     float pc[2][4] = { { 0, 0, 0, a * 2.5f }, { 1, 1, 1, 0 } }; oPSC(d, 4, pc[0], 2);
 }
 static HRESULT STDMETHODCALLTYPE hkDP(IDirect3DDevice9* d, D3DPRIMITIVETYPE t, UINT a, UINT b) { R1NoteIfEye(); HPScope _hp(HP_DP); g_fDraws++; if (g_diagOn || CAPON) RefreshTexState(d); if (g_diagOn) DiagDraw(); if (g_inBandRT) return D3D_OK; if (g_movieHold > 0 && (RefreshStream(d), MovieBar(t, a, b))) return D3D_OK; OVERLAY_SKIP(); bool ui = UiPreDraw(d); UI_SKIP(); if (ui && (RefreshStream(d), ParkedIcon(t, a, b))) { UiPost(d, ui); return D3D_OK; } if (CAPON) { g_da = { 1, t, a, 0, b, nullptr, 0, 0, b, d }; CapDraw(RA, b); PostRec(RA, b); } Tweak tw; if (UiTweakPre(d, tw) == TW_RETICLE) ReticleDraws(d, tw, [&] { oDP(d, t, a, b); }); HRESULT hr = oDP(d, t, a, b); if (tw.kind) UiTweakPost(d, tw); UiPost(d, ui); return hr; }
-static HRESULT STDMETHODCALLTYPE hkDIP(IDirect3DDevice9* d, D3DPRIMITIVETYPE t, INT a, UINT b, UINT c, UINT e, UINT f) { R1NoteIfEye(); if (g_fpProbe) FpProbeDraw(d, f, c); const int fpClip = g_fpHideOn ? FpClipPre(d) : 0; for (int k = 0; k < g_intzN; k++) if (g_curDS == g_intz[k].surf) { g_intz[k].draws++; break; } HPScope _hp(HP_DIP); g_fDraws++; if (g_diagOn || CAPON) RefreshTexState(d); if (g_diagOn) DiagDraw(); if (g_inBandRT) return D3D_OK; OVERLAY_SKIP(); if (PrimPre(d, t, a, b, c, e, f)) return D3D_OK; bool ui = UiPreDraw(d); UI_SKIP(); if (CAPON) { g_da = { 2, t, (UINT)a, b, c, nullptr, 0, e, f, d }; CapDraw(RA, f); PostRec(RA, f); } static unsigned dipN; bool timed = g_prof && (++dipN & 15) == 0; double t0 = timed ? NowMs() : 0; Tweak tw; if (UiTweakPre(d, tw) == TW_RETICLE) ReticleDraws(d, tw, [&] { oDIP(d, t, a, b, c, e, f); }); HRESULT hr = oDIP(d, t, a, b, c, e, f); if (fpClip == 2) { FpClipSecond(d); oDIP(d, t, a, b, c, e, f); } if (fpClip) oSetRS(d, D3DRS_CLIPPLANEENABLE, 0); if (tw.kind) UiTweakPost(d, tw); if (timed) g_s.drawMs += (NowMs() - t0) * 16.0; UiPost(d, ui); PrimPost(d); return hr; }
+static HRESULT STDMETHODCALLTYPE hkDIP(IDirect3DDevice9* d, D3DPRIMITIVETYPE t, INT a, UINT b, UINT c, UINT e, UINT f) { R1NoteIfEye(); if (g_fpProbe) FpProbeDraw(d, f, c); const int fpClip = g_fpHideOn ? FpClipPre(d) : 0; for (int k = 0; k < g_intzN; k++) if (g_curDS == g_intz[k].surf) { g_intz[k].draws++; break; } HPScope _hp(HP_DIP); g_fDraws++; if (g_diagOn || CAPON) RefreshTexState(d); if (g_diagOn) DiagDraw(); if (g_inBandRT) return D3D_OK; OVERLAY_SKIP(); if (PrimPre(d, t, a, b, c, e, f)) return D3D_OK; bool ui = UiPreDraw(d); UI_SKIP(); if (CAPON) { g_da = { 2, t, (UINT)a, b, c, nullptr, 0, e, f, d }; CapDraw(RA, f); PostRec(RA, f); } static unsigned dipN; bool timed = g_prof && (++dipN & 15) == 0; double t0 = timed ? NowMs() : 0; Tweak tw; if (UiTweakPre(d, tw) == TW_RETICLE) ReticleDraws(d, tw, [&] { oDIP(d, t, a, b, c, e, f); }); HRESULT hr = oDIP(d, t, a, b, c, e, f); if (fpClip & 2) { FpClipSecond(d); oDIP(d, t, a, b, c, e, f); } if (fpClip & 1) oSetRS(d, D3DRS_CLIPPLANEENABLE, 0); if (fpClip & 4) FpUnbindPlayerTex(d); if (tw.kind) UiTweakPost(d, tw); if (timed) g_s.drawMs += (NowMs() - t0) * 16.0; UiPost(d, ui); PrimPost(d); return hr; }
 static HRESULT STDMETHODCALLTYPE hkDPUP(IDirect3DDevice9* d, D3DPRIMITIVETYPE t, UINT a, const void* p, UINT s) { R1NoteIfEye(); g_fDraws++; if (g_diagOn || CAPON) RefreshTexState(d); if (g_diagOn) DiagDraw(); g_s.drawsUP++; OVERLAY_SKIP(); bool ui = UiPreDraw(d); UI_SKIP(); if (CAPON) { g_da = { 3, t, 0, 0, a, p, s, 0, a, d }; CapDraw(RA, a); PostRec(RA, a); } HRESULT hr = oDPUP(d, t, a, p, s); UiPost(d, ui); return hr; }
 static HRESULT STDMETHODCALLTYPE hkDIPUP(IDirect3DDevice9* d, D3DPRIMITIVETYPE t, UINT a, UINT b, UINT c, const void* i, D3DFORMAT f, const void* v, UINT s) { R1NoteIfEye();
     g_fDraws++; if (g_diagOn || CAPON) RefreshTexState(d); if (g_diagOn) DiagDraw(); g_s.drawsUP++; OVERLAY_SKIP(); bool ui = UiPreDraw(d); UI_SKIP(); if (CAPON) { g_da = { 4, t, a, b, c, v, s, 0, c, d }; CapDraw(RA, c); PostRec(RA, c); } HRESULT hr = oDIPUP(d, t, a, b, c, i, f, v, s); UiPost(d, ui); return hr;
@@ -1995,7 +2022,7 @@ static void FpFindTarget(void* cam, const float* V, const float* P) {
                                         const float vv = vstep[0] * vstep[0] + vstep[1] * vstep[1] + vstep[2] * vstep[2];
                                         const long ln = g_fpLagN;
                                         if (ln != lastLagN) { lastLagN = ln;
-                                            if (vv > 4.0f && vv < 2500.0f) { float c = (g_fpLagD[0] * vstep[0] + g_fpLagD[1] * vstep[1] + g_fpLagD[2] * vstep[2]) / vv; if (c > 2) c = 2; if (c < -2) c = -2; lag += 0.08f * c; if (lag < 0) lag = 0; if (lag > 6) lag = 6; } }
+                                            if (vv > 4.0f && vv < 2500.0f) { float c = (g_fpLagD[0] * vstep[0] + g_fpLagD[1] * vstep[1] + g_fpLagD[2] * vstep[2]) / vv; if (c > 2) c = 2; if (c < -2) c = -2; (void)c; lag = 0; } }
                                         {   // build 118: the head's bob and sway over the body are smoothed (FpSmooth seconds; the walk and run
                                             // cycles shook the view); the body's own travel and the lead are not
                                             static float tau = -1; if (tau < 0) { wchar_t b2[32]; GetPrivateProfileStringW(L"VR", L"FpSmooth", L"0.30", b2, 32, g_ini); tau = (float)_wtof(b2); if (tau < 0) tau = 0; if (tau > 2) tau = 2; Log("fp: head motion smoothing %.2f s", tau); }
@@ -2068,11 +2095,10 @@ static void FpFindTarget(void* cam, const float* V, const float* P) {
                         }
                     }
                 }
-                g_fpHideOn = ok && dxr::FirstPerson(); g_fpWantBones = g_fpHideOn; g_fpRootOk = ok; InterlockedIncrement(&g_camSeq);
-                { static DWORD lastD; if (g_fpHideOn && nowT - lastD > 10000) { lastD = nowT; g_dgOrder[g_dgOrderN < 63 ? g_dgOrderN : 63] = 0;
-                    Log("fp: diag - %ld bone-texture unlocks (order %s), player frames drawn %ld, bone texture age at draw 0:%ld 1:%ld 2:%ld 3:%ld 4:%ld 5+:%ld camera frames, changed between left and right eye %ld times, texture unknown %ld draws; bones the game had not rewritten: player %ld, equipment %ld",
-                        InterlockedExchange(&g_dgUnlock, 0), g_dgOrder, InterlockedExchange(&g_dgFrames, 0), InterlockedExchange(&g_dgDepth[0], 0), InterlockedExchange(&g_dgDepth[1], 0), InterlockedExchange(&g_dgDepth[2], 0), InterlockedExchange(&g_dgDepth[3], 0), InterlockedExchange(&g_dgDepth[4], 0), InterlockedExchange(&g_dgDepth[5], 0),
-                        InterlockedExchange(&g_dgEyeMis, 0), InterlockedExchange(&g_dgNoTex, 0), InterlockedExchange(&g_dgStalePl, 0), InterlockedExchange(&g_dgStaleEq, 0)); g_dgOrderN = 0; } }
+                g_fpHideOn = ok && dxr::FirstPerson(); g_fpWantBones = g_fpHideOn; g_fpRootOk = ok; InterlockedIncrement(&g_camSeq); dxr::SetFpSeq(g_camSeq);
+                { static DWORD lastD; if (g_fpHideOn && nowT - lastD > 10000) { lastD = nowT;
+                    Log("fp: diag - %ld bone-texture unlocks, %ld player/equipment draws from the mod's bone texture, texture refilled %ld times from the matching camera frame and %ld times from another",
+                        InterlockedExchange(&g_dgUnlock, 0), InterlockedExchange(&g_dgBound, 0), InterlockedExchange(&g_dgSnapMatch, 0), InterlockedExchange(&g_dgSnapOther, 0)); g_dgOrderN = 0; } }
                 { static DWORD lastC; if (g_fpHideOn && nowT - lastC > 10000) { lastC = nowT; Log("fp: own-body cut used on %ld draws, carried-equipment cut on %ld draws in the last 10 s", InterlockedExchange(&g_fpClipped, 0), InterlockedExchange(&g_fpClippedEq, 0)); } }
                 if ((int)ok != state) { state = ok; Log("fp: %s (camera class %p, distance %.0f)", ok ? "character found under the camera target - first person available" : "no character under the camera target - first person paused", *(void* const*)o, dist); }
             }
@@ -2314,6 +2340,8 @@ static int g_noVignette = 1; static bool g_vigShown;      // g_vigShown: F11 sta
 typedef HRESULT(STDMETHODCALLTYPE* TexLock_t)(IDirect3DTexture9*, UINT, D3DLOCKED_RECT*, const RECT*, DWORD);
 typedef HRESULT(STDMETHODCALLTYPE* TexUnlock_t)(IDirect3DTexture9*, UINT);
 static TexLock_t oTexLock; static TexUnlock_t oTexUnlock;
+static HRESULT FpTexLockRaw(IDirect3DTexture9* t, D3DLOCKED_RECT* lr, DWORD fl) { return oTexLock(t, 0, lr, nullptr, fl); }
+static HRESULT FpTexUnlockRaw(IDirect3DTexture9* t) { return oTexUnlock(t, 0); }
 struct VigCand { IDirect3DTexture9* t; D3DFORMAT f; UINT w, h; void* bits; INT pitch; bool isVig; std::string orig; };
 enum { VIGN = 32 };
 static VigCand g_vig[VIGN]; static CRITICAL_SECTION g_vigCs; static bool g_vigCsInit;

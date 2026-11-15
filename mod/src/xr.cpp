@@ -296,7 +296,7 @@ static int g_track = 1, g_headPos = 1, g_lag = 0; static float g_scale = 100.0f;
 static bool g_frameOpen; static XrFrameState g_fs{ XR_TYPE_FRAME_STATE };
 static Q g_refYaw{ 0, 0, 0, 1 }; static float g_refPos[3]; static bool g_refSet, g_wantRef;
 static long g_camCalls, g_camApplied;
-static int g_fp, g_autoRecenter = 1; static float g_fpUp, g_fpFwd = 0.0f, g_fpHide = 0.22f, g_fpBarPush = 65.0f, g_fpBarLift = 12.0f, g_fpRetDist = 3000.0f, g_fpEye[3]; static volatile bool g_fpEyeValid, g_fpActive, g_fpLookOk; static float g_fpLook[2];   // build 108
+static int g_fp, g_autoRecenter = 1; static float g_fpUp, g_fpFwd = 0.0f, g_fpHide = 0.22f, g_fpBarPush = 65.0f, g_fpBarLift = 12.0f, g_fpRetDist = 3000.0f, g_fpEye[3]; static volatile bool g_fpEyeValid, g_fpActive, g_fpLookOk; static float g_fpLook[2]; static volatile long g_fpSeq = -1;   // build 108
 
 void ConfigureTracking(const wchar_t* ini) {
     g_track = GetPrivateProfileIntW(L"VR", L"HeadTracking", 1, ini);
@@ -404,7 +404,7 @@ struct SyncCam { bool valid; float VP[16]; float M[16]; Pose pose;
                  float V[16], VR[16], Vi[16], ViR[16], VPi[16], VPiR[16], camL[3], camR[3];
                  float T[16], Ti[16], Mi[16];
                  double VPu[2][16]; float jx, jy; bool depthInv; long id;
-                 float Mh[16], Pj[16], s, xs0, ys0; bool mh, fp; float fpEye[3]; };   // build 083: head transform (game view -> left eye view), eye projection, game y scale   // build 075: unjittered per-eye VP, jitter (render px), depth convention   // build 052: eye offset forms for relative substitution   // build 043: all eye-dependent forms
+                 float Mh[16], Pj[16], s, xs0, ys0; bool mh, fp; float fpEye[3]; long fpSeq; };   // build 083: head transform (game view -> left eye view), eye projection, game y scale   // build 075: unjittered per-eye VP, jitter (render px), depth convention   // build 052: eye offset forms for relative substitution   // build 043: all eye-dependent forms
 static long g_subN[8];   // per kind: 0 VP, 1 VP^-1, 2 V, 3 V^-1, 4 V^-1 transposed 3x4, 5 camera position (VS), 6 PS forms
 static SyncCam g_cams[4]; static long g_camN; static volatile int g_replayEye = -1; static volatile int g_replayCam = -1;
 static long g_subs, g_subFrames, g_camMatch;
@@ -425,7 +425,7 @@ static bool MatInv(const float* m, float* o) {   // general 4x4 inverse (Gauss-J
 static void MatMulD(const double* a, const double* b, double* o) { for (int i = 0; i < 4; i++) for (int j = 0; j < 4; j++) { double x = 0; for (int k = 0; k < 4; k++) x += a[i * 4 + k] * b[k * 4 + j]; o[i * 4 + j] = x; } }
 static void SyncRecord(const Pose& p, const float* V, const float* P, float s, const float* Pu, float jx, float jy, const float* Mh, float xs0, float ys0) {
     SyncCam c{}; c.pose = p; MatMul(V, P, c.VP);
-    if (Mh) { memcpy(c.Mh, Mh, 64); c.mh = true; } c.fp = g_fpActive; memcpy(c.fpEye, g_fpEye, 12); memcpy(c.Pj, P, 64); c.s = s; c.xs0 = xs0; c.ys0 = ys0;
+    if (Mh) { memcpy(c.Mh, Mh, 64); c.mh = true; } c.fp = g_fpActive; memcpy(c.fpEye, g_fpEye, 12); c.fpSeq = g_fpSeq; memcpy(c.Pj, P, 64); c.s = s; c.xs0 = xs0; c.ys0 = ys0;
     // right-eye offset in the left eye's view axes (OpenXR head axes: x right, y up, +z back; left-handed game: flip z)
     float dw[3] = { p.posR[0] - p.pos[0], p.posR[1] - p.pos[1], p.posR[2] - p.pos[2] }, dh[3]; Rot(Conj(p.abs), dw, dh);
     { float ipd = sqrtf(dw[0] * dw[0] + dw[1] * dw[1] + dw[2] * dw[2]); if (ipd > 0.04f && ipd < 0.09f) g_ipdM = ipd; }
@@ -592,6 +592,9 @@ bool WorldPlaneToClip(const float* pw, float* pc) {
     for (int i = 0; i < 4; i++) pc[i] = I[i * 4] * pw[0] + I[i * 4 + 1] * pw[1] + I[i * 4 + 2] * pw[2] + I[i * 4 + 3] * pw[3];
     return true;
 }
+// build 126: the game-thread camera frame number the camera being drawn belongs to (set by the proxy before each camera setup)
+void SetFpSeq(long q) { g_fpSeq = q; }
+long ReplayFpSeq() { if (g_replayCam < 0) return -1; const SyncCam& c = g_cams[g_replayCam]; return c.valid ? c.fpSeq : -1; }
 // the first-person eye point the camera being drawn was built with (world)
 bool ReplayFpEye(float* e) {
     if (g_replayCam < 0) return false; const SyncCam& c = g_cams[g_replayCam]; if (!c.valid || !c.fp) return false;

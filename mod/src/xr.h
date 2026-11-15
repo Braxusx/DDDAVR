@@ -17,6 +17,8 @@ bool FirstPerson();
 bool FpClipPlane(float* plane4);
 bool WorldPlaneToClip(const float* planeWorld, float* planeClip);
 bool ReplayFpEye(float* e);
+void SetFpSeq(long q);
+long ReplayFpSeq();
 bool FpLookDir(float* fx, float* fz);
 // camera hook: view (cam+0x90) and projection (cam+0xd0) of the main camera, modified in place; true if changed
 bool ApplyToCamera(float* view, float* proj);
