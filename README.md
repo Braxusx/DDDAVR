@@ -3,6 +3,9 @@
 Dragon's Dogma: Dark Arisen VR mod with native stereo rendering and DLSS / DXVK support, for the Steam and GOG releases.
 
 - Full native stereo (each eye rendered from its own camera) with head tracking around the game's third-person view
+- First person view (F4, or RB + a long press of the right stick): eye at the character's eyes, own body visible, bow reticle at
+  the arrow's landing point
+- World scale: launcher slider and in-game menu (Insert, Left / Right); automatic recentring at start
 - NVIDIA DLSS / DLAA through a 64-bit helper process (the game itself is 32-bit)
 - Optional DXVK (Vulkan) with a "Building shader cache" notice in the headset
 - Extended draw distance: Game Default, 2X (performance impact), 3X (extreme performance impact)

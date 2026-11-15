@@ -211,7 +211,7 @@ static void WorldScaleRow() {
     ImGui::PushID("wscale");
     float ctrlW = 300 * g_s, x0 = ImGui::GetCursorPosX(), avail = ImGui::GetContentRegionAvail().x, y0 = ImGui::GetCursorPosY();
     ImGui::BeginDisabled(!Installed());
-    RowLabel("World scale", "How large the world feels. 1.00 is the game's own scale; higher makes everything look bigger, lower smaller.", ctrlW);
+    RowLabel("World scale", "How large the world feels. 1.00 is the game's own scale; higher makes everything look bigger, lower smaller. In game, Insert opens the same setting and the Left / Right arrows change it.", ctrlW);
     float y1 = ImGui::GetCursorPosY();
     ImGui::SetCursorPos(ImVec2(x0 + avail - ctrlW, y0)); ImGui::SetNextItemWidth(ctrlW);
     ImGuiStorage* stg = ImGui::GetStateStorage(); ImGuiID vid = ImGui::GetID("##val"), aid = ImGui::GetID("##act");
@@ -441,7 +441,7 @@ static void PageSettingsDraw() {
     bool dlss = Get(L"Dlss", L"1") != L"0";
     theme::SectionTitle("DLSS Settings");
     theme::BeginCard("dlss");
-    ComboRow("Upscaler", "NVIDIA DLSS needs an RTX graphics card. Off renders at the full headset resolution.", L"Dlss", L"1", kUpscaler, 2, Installed());
+    ComboRow("Upscaler", "NVIDIA DLSS needs an RTX graphics card. Off renders at the full headset resolution. The Home key switches it on and off in game.", L"Dlss", L"1", kUpscaler, 2, Installed());
     ComboRow("Upscaler quality", nullptr, L"DlssQuality", L"0", kQuality, 6, Installed() && dlss);
     if (dlss) {
         int q = _wtoi(Get(L"DlssQuality", L"0").c_str()); if (q < 0 || q > 5) q = 0;
@@ -457,7 +457,7 @@ static void PageSettingsDraw() {
     theme::SectionTitle("View");
     theme::BeginCard("view");
     WorldScaleRow();
-    ToggleKey("First person view (Experimental)", "The view sits at your character's head instead of behind them. There to try what it feels like; F2 switches it in game.", L"FirstPerson", L"0");
+    ToggleKey("First person view", "Start in first person: the view sits at your character's eyes instead of behind them. In game, F4 on the keyboard, or holding RB and a long press of the right stick on the gamepad, switches between first and third person at any time.", L"FirstPerson", L"0");
     ImGui::Dummy(ImVec2(1, 4 * g_s));
     ToggleKey("Recentre automatically at start", "Recentres the view during the first seconds after the game starts and when the first 3D view appears, so the logos, the menu and the world are in front of you. F7 recentres at any time.", L"AutoRecenter", L"1");
     theme::EndCard();
@@ -514,6 +514,8 @@ static void PageAboutDraw() {
     ImGui::Dummy(ImVec2(1, 4 * g_s));
     theme::Bullet("Head tracking and full stereo rendering of the game's own third-person view");
     theme::Bullet("NVIDIA DLSS and DLAA through a 64-bit helper (the game itself is 32-bit)");
+    theme::Bullet("First person view: F4, or RB + a long press of the right stick, switches between first and third person");
+    theme::Bullet("In game keys: F6 head tracking / virtual screen, F7 recentre, Insert world scale, Home DLSS on / off");
     theme::Bullet("Supports the Steam and GOG releases");
     theme::EndCard();
     theme::SectionTitle("Need Help?");
