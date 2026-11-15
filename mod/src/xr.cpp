@@ -297,6 +297,7 @@ void ShowMenu(const wchar_t* line1, const wchar_t* line2); void HideMenu();
 static bool g_frameOpen; static XrFrameState g_fs{ XR_TYPE_FRAME_STATE };
 static Q g_refYaw{ 0, 0, 0, 1 }; static float g_refPos[3]; static bool g_refSet, g_wantRef;
 static long g_camCalls, g_camApplied;
+static WORD g_fpPadMask = 0x2200; static WORD PadMask(const wchar_t* t);   // build 134: RB + B
 static int g_fp, g_autoRecenter = 1; static float g_fpUp, g_fpFwd = 0.0f, g_fpHide = 0.22f, g_fpBarPush = 65.0f, g_fpBarLift = 12.0f, g_fpRetDist = 3000.0f, g_fpEye[3]; static volatile bool g_fpEyeValid, g_fpActive, g_fpLookOk; static float g_fpLook[2]; static volatile long g_fpSeq = -1;   // build 108
 
 void ConfigureTracking(const wchar_t* ini) {
@@ -316,13 +317,31 @@ void ConfigureTracking(const wchar_t* ini) {
       GetPrivateProfileStringW(L"VR", L"FpHide", L"0.22", u, 32, ini); g_fpHide = (float)_wtof(u);
       GetPrivateProfileStringW(L"VR", L"FpBarPush", L"65", u, 32, ini); g_fpBarPush = (float)_wtof(u);
       GetPrivateProfileStringW(L"VR", L"FpBarLift", L"12", u, 32, ini); g_fpBarLift = (float)_wtof(u);
-      GetPrivateProfileStringW(L"VR", L"FpReticleDist", L"3000", u, 32, ini); g_fpRetDist = (float)_wtof(u); if (g_fpRetDist < 100) g_fpRetDist = 100; }
+      GetPrivateProfileStringW(L"VR", L"FpReticleDist", L"3000", u, 32, ini); g_fpRetDist = (float)_wtof(u); if (g_fpRetDist < 100) g_fpRetDist = 100;
+      GetPrivateProfileStringW(L"VR", L"FpPadButtons", L"RB+B", u, 32, ini); g_fpPadMask = PadMask(u); }
     g_autoRecenter = GetPrivateProfileIntW(L"VR", L"AutoRecenter", 1, ini);
     Log("xr: FirstPerson=%d (F2 switches; eye %.2f m up, %.2f m forward of the character's head position; own body hidden within %.2f m) AutoRecenter=%d", g_fp, g_fpUp, g_fpFwd, g_fpHide, g_autoRecenter);
 }
 
 // build 108: first person. proxy.cpp finds the game camera's look-at target each frame (SetFpEye); the eye is put there and
 // the view is rebuilt level (the game camera's heading only, world up = +y) before the head pose is applied.
+// build 134: the head centre of the final first-person view and the game camera's own position, in the world (game thread), for
+// the arrow launch (proxy.cpp BowAimFix); FpPadButtons = gamepad combination that switches first / third person
+static float g_fpHeadW[3], g_fpGameCamW[3]; static DWORD g_fpHeadTick;
+bool FpHeadWorld(float* head, float* gameCam) {
+    if (!g_fpActive || GetTickCount() - g_fpHeadTick > 500) return false;
+    memcpy(head, g_fpHeadW, 12); memcpy(gameCam, g_fpGameCamW, 12); return true;
+}
+float FpReticleDist() { return g_fpRetDist; }
+static WORD PadMask(const wchar_t* t) {   // "RB+B" -> XInput button bits; unknown names are ignored, empty / 0 = off
+    static const struct { const wchar_t* n; WORD m; } k[] = { { L"UP", 1 }, { L"DOWN", 2 }, { L"LEFT", 4 }, { L"RIGHT", 8 }, { L"START", 0x10 }, { L"BACK", 0x20 },
+        { L"LS", 0x40 }, { L"RS", 0x80 }, { L"LB", 0x100 }, { L"RB", 0x200 }, { L"A", 0x1000 }, { L"B", 0x2000 }, { L"X", 0x4000 }, { L"Y", 0x8000 } };
+    WORD m = 0; wchar_t w[16]; int n = 0;
+    for (const wchar_t* c = t;; c++) {
+        if (*c && *c != L'+' && *c != L' ' && *c != L',') { if (n < 15) w[n++] = (wchar_t)towupper(*c); continue; }
+        w[n] = 0; if (n) for (auto& e : k) if (!wcscmp(w, e.n)) m |= e.m; n = 0; if (!*c) break; }
+    return m;
+}
 void SetFpEye(const float* target, bool valid) { if (valid) memcpy(g_fpEye, target, 12); g_fpEyeValid = valid; }
 bool FirstPerson() { return g_fp != 0; }
 bool FpLookDir(float* fx, float* fz) { if (!g_fpLookOk || !g_fpActive) return false; *fx = g_fpLook[0]; *fz = g_fpLook[1]; return true; }
@@ -546,7 +565,8 @@ bool WorldGuiToEye(int mode, float x, float y, float z, float* X, float* Y, floa
     // build 133: in first person the game's anchor can lie behind the eye (a pawn beside you: his bar is placed 65 units towards
     // the third-person camera, which is behind you). The game still projects it, mirrored through the eye, and the depth equation
     // then gives a negative t - which is the true place. Keep it; 115-132 replaced it by the raw depth and the bar wandered.
-    if (t < 1.0f && !(c.fp && fabsf(a) > 1e-4f && t < -1.0f)) t = z;
+    // build 134: ... and so is a t near zero (the anchor passing the eye plane); the raw depth there made the bar jump.
+    if (t < 1.0f && !(c.fp && fabsf(a) > 1e-4f)) t = z;
     float pe[4] = { r[0] * t, r[1] * t, r[2] * t, 1.0f };
     if (mode & 0x200) {   // build 122: the aiming reticle in first person - a point far along the game camera's own axis (where
         // the game shoots), seen from the first-person eye; the level first-person view does not carry the camera's pitch
@@ -668,6 +688,10 @@ bool ApplyToCamera(float* V, float* P) {
     if (row) { for (int i = 0; i < 4; i++) for (int j = 0; j < 4; j++) { float a = 0; for (int k = 0; k < 4; k++) a += V[i * 4 + k] * M[k * 4 + j]; out[i * 4 + j] = a; } }   // V' = V * M
     else { for (int i = 0; i < 4; i++) for (int j = 0; j < 4; j++) { float a = 0; for (int k = 0; k < 4; k++) a += M[k * 4 + i] * V[k * 4 + j]; out[i * 4 + j] = a; } }    // V' = M^T * V
     memcpy(V, out, sizeof out);
+    if (fpOn && row) {   // build 134: centre of the final view and of the game's own camera in the world (row-vector view: C = -t R^T)
+        for (int j = 0; j < 3; j++) { g_fpHeadW[j] = -(V[12] * V[j * 4] + V[13] * V[j * 4 + 1] + V[14] * V[j * 4 + 2]);
+            g_fpGameCamW[j] = -(gameV[12] * gameV[j * 4] + gameV[13] * gameV[j * 4 + 1] + gameV[14] * gameV[j * 4 + 2]); }
+        g_fpHeadTick = GetTickCount(); }
     if (fpOn && row) {   // build 118: where the head looks, level, in the world (view z axis = column 2; the view looks down -s z)
         float fx = V[2] * (s > 0 ? 1.f : -1.f), fz = V[10] * (s > 0 ? 1.f : -1.f), l = sqrtf(fx * fx + fz * fz);
         if (l > 0.2f) { g_fpLook[0] = fx / l; g_fpLook[1] = fz / l; g_fpLookOk = true; }
@@ -971,8 +995,19 @@ static void OnPresentLocked(IDirect3DDevice9* dev) {
             }
         }
         static bool f2p; bool f2 = (GetAsyncKeyState(VK_F2) & 0x8000) != 0;   // build 108: first person on / off
-        if (f2 && !f2p) { g_fp = !g_fp; Log("xr: F2 -> first person %s", g_fp ? "on" : "off"); ShowMessage(g_fp ? L"First person: ON (experimental)" : L"First person: OFF", 2.0); }
-        f2p = f2;
+        bool pad = false;
+        if (g_fpPadMask) {   // build 134: the same switch on the gamepad (FpPadButtons, default RB+B), all buttons of the combination held
+            typedef DWORD(WINAPI* XGS)(DWORD, void*); static XGS xgs; static bool tried; static int idx = 0; static double scanAt;
+            if (!tried) { tried = true; HMODULE h = GetModuleHandleW(L"xinput1_3.dll"); if (!h) h = LoadLibraryW(L"xinput1_3.dll"); if (!h) h = LoadLibraryW(L"xinput9_1_0.dll");
+                if (h) xgs = (XGS)GetProcAddress(h, "XInputGetState"); Log("xr: gamepad switch for first person: buttons 0x%04x, XInput %s", g_fpPadMask, xgs ? "found" : "NOT found"); }
+            if (xgs) { struct { DWORD pkt; WORD btn; BYTE lt, rt; SHORT lx, ly, rx, ry; } st;
+                if (idx >= 0 && xgs((DWORD)idx, &st) == 0) pad = (st.btn & g_fpPadMask) == g_fpPadMask;
+                else if (now >= scanAt) { scanAt = now + 2000; idx = -1; for (DWORD i = 0; i < 4; i++) if (xgs(i, &st) == 0) { idx = (int)i; break; } }   // an absent pad is slow to ask: look again every 2 s only
+            }
+        }
+        static bool padp;
+        if ((f2 && !f2p) || (pad && !padp)) { g_fp = !g_fp; Log("xr: %s -> first person %s", pad && !padp ? "gamepad" : "F2", g_fp ? "on" : "off"); ShowMessage(g_fp ? L"First person: ON" : L"First person: OFF", 2.0); }
+        f2p = f2; padp = pad;
         if (!runSince) runSince = now;
         // build 108: automatic recentre (AutoRecenter=1): 1, 3 and 6 s after the session starts, and 0.5 s after the game's
         // 3D camera first takes over from the flat screen - so the logos, the menu and the first view are in front of you
