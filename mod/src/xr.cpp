@@ -292,7 +292,8 @@ static Pose g_used[4]; static long g_nUsed; static Pose g_lastEye[2];   // build
 // replays frame N, so "the latest camera" is not the presented one. Each eye's projection is distinct (asymmetric FOV):
 // the render thread's VS constant uploads are scanned for a row/column of either eye's projection.
 static float g_eyeP[2][16]; static volatile bool g_eyePValid[2]; static volatile int g_seenEye = -1; static long g_eyeMiss, g_eyeHit;   // poses the camera setups actually used
-static int g_track = 1, g_headPos = 1, g_lag = 0; static float g_scale = 100.0f;
+static int g_track = 1, g_headPos = 1, g_lag = 0; static float g_scale = 100.0f; static wchar_t g_iniPath[MAX_PATH];
+void ShowMenu(const wchar_t* line1, const wchar_t* line2); void HideMenu();
 static bool g_frameOpen; static XrFrameState g_fs{ XR_TYPE_FRAME_STATE };
 static Q g_refYaw{ 0, 0, 0, 1 }; static float g_refPos[3]; static bool g_refSet, g_wantRef;
 static long g_camCalls, g_camApplied;
@@ -306,6 +307,7 @@ void ConfigureTracking(const wchar_t* ini) {
     g_stereo = GetPrivateProfileIntW(L"VR", L"Stereo", 2, ini);   // build 042: 0 mono, 1 alternate eyes, 2 both eyes every frame
     { wchar_t u[32]; GetPrivateProfileStringW(L"VR", L"UiDistance", L"3.0", u, 32, ini); g_uiDist = (float)_wtof(u); if (g_uiDist < 0.5f) g_uiDist = 3.0f; }
     wchar_t b[32]; GetPrivateProfileStringW(L"VR", L"WorldScale", L"100", b, 32, ini); g_scale = (float)_wtof(b); if (g_scale <= 0) g_scale = 100;
+    wcsncpy(g_iniPath, ini, MAX_PATH - 1); g_iniPath[MAX_PATH - 1] = 0;
     Log("xr: HeadTracking=%d HeadPosition=%d WorldScale %.1f units/m PoseLag %d (F6 toggles tracking / screen, F7 recentres)", g_track, g_headPos, g_scale, g_lag);
     // build 108: first person (experimental), automatic recentre
     g_fp = GetPrivateProfileIntW(L"VR", L"FirstPerson", 0, ini);
@@ -744,6 +746,7 @@ static XrCompositionLayerQuad g_nq{ XR_TYPE_COMPOSITION_LAYER_QUAD };
 static const UINT NW = 1024, NH = 128;
 // build 101: a text picture (rounded dark panel, premultiplied alpha) for the head-locked notice quad; `layout` = the
 // longest text of a set, so animated variants stay at the same place
+static float g_tpAlpha = 0.88f; static const wchar_t* g_tpLine2;   // build 132: the in-game menu panel is more see-through and has a second, smaller line
 static bool TextPicture(const wchar_t* text, const wchar_t* layout, ID3D11Texture2D** out) {
     HDC dc = CreateCompatibleDC(nullptr);
     BITMAPINFO bi{}; bi.bmiHeader.biSize = sizeof bi.bmiHeader; bi.bmiHeader.biWidth = NW; bi.bmiHeader.biHeight = -(LONG)NH; bi.bmiHeader.biPlanes = 1; bi.bmiHeader.biBitCount = 32;
@@ -759,12 +762,20 @@ static bool TextPicture(const wchar_t* text, const wchar_t* layout, ID3D11Textur
         uint32_t* px = (uint32_t*)bits;
         RECT rc = { 0, 0, (LONG)NW, (LONG)NH };
         HBRUSH br = CreateSolidBrush(RGB(22, 24, 30)); FillRect(dc, &rc, br); DeleteObject(br);
-        TextOutW(dc, x0, y0, text, (int)wcslen(text));
+        if (g_tpLine2) {
+            HFONT f1 = CreateFontW(-(int)(NH * 0.40f), 0, 0, 0, FW_SEMIBOLD, 0, 0, 0, DEFAULT_CHARSET, 0, 0, ANTIALIASED_QUALITY, 0, L"Segoe UI");
+            HFONT f2 = CreateFontW(-(int)(NH * 0.24f), 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, 0, 0, ANTIALIASED_QUALITY, 0, L"Segoe UI");
+            SIZE s1{}, s2{}; SelectObject(dc, f1); GetTextExtentPoint32W(dc, text, (int)wcslen(text), &s1);
+            TextOutW(dc, ((int)NW - s1.cx) / 2, (int)(NH * 0.08f), text, (int)wcslen(text));
+            SelectObject(dc, f2); SetTextColor(dc, RGB(200, 204, 212)); GetTextExtentPoint32W(dc, g_tpLine2, (int)wcslen(g_tpLine2), &s2);
+            TextOutW(dc, ((int)NW - s2.cx) / 2, (int)(NH * 0.60f), g_tpLine2, (int)wcslen(g_tpLine2));
+            SelectObject(dc, f); DeleteObject(f1); DeleteObject(f2);
+        } else TextOutW(dc, x0, y0, text, (int)wcslen(text));
         GdiFlush();
         for (UINT y = 0; y < NH; y++) for (UINT x = 0; x < NW; x++) {   // alpha: rounded corners, 88% panel; premultiplied
             float dx = fmaxf(0.0f, fmaxf(R - (x + 0.5f), (x + 0.5f) - (NW - R))), dy = fmaxf(0.0f, fmaxf(R - (y + 0.5f), (y + 0.5f) - (NH - R)));
             float cov = fminf(1.0f, fmaxf(0.0f, R - sqrtf(dx * dx + dy * dy) + 0.5f));
-            uint32_t& c = px[y * NW + x]; float a = 0.88f * cov;
+            uint32_t& c = px[y * NW + x]; float a = g_tpAlpha * cov;
             uint32_t b = (uint32_t)((c & 0xff) * a), g = (uint32_t)(((c >> 8) & 0xff) * a), r = (uint32_t)(((c >> 16) & 0xff) * a);
             c = b | g << 8 | r << 16 | (uint32_t)(a * 255.0f + 0.5f) << 24;
         }
@@ -778,7 +789,7 @@ static bool TextPicture(const wchar_t* text, const wchar_t* layout, ID3D11Textur
     return ok;
 }
 // build 101: short messages (e.g. the draw distance test keys), shown for 2.5 s instead of the shader cache notice
-static CRITICAL_SECTION g_toastCs; static bool g_toastCsInit; static wchar_t g_toastText[64]; static volatile long g_toastSeq; static long g_toastBuilt; static double g_toastUntil;
+static CRITICAL_SECTION g_toastCs; static bool g_toastCsInit; static wchar_t g_toastText[64]; static volatile long g_toastSeq; static long g_toastBuilt; static double g_toastUntil; static wchar_t g_toastLine2[80]; static bool g_toastMenu;
 static bool NoticeInit() {
     if (g_scN) return true;
     if (g_nBad || !g_scFmt) return false;
@@ -809,8 +820,9 @@ static const XrCompositionLayerBaseHeader* NoticeLayer() {
     int v = (int)(Ms() / 450.0) % 4;
     if (toast) {
         if (g_toastBuilt != g_toastSeq) {
-            wchar_t t[64]; EnterCriticalSection(&g_toastCs); wcscpy(t, g_toastText); long seq = g_toastSeq; LeaveCriticalSection(&g_toastCs);
-            Rel(g_nTex[4]); if (!TextPicture(t, t, &g_nTex[4])) return nullptr;
+            wchar_t t[64], t2[80]; EnterCriticalSection(&g_toastCs); wcscpy(t, g_toastText); wcscpy(t2, g_toastLine2); const bool menu = g_toastMenu; long seq = g_toastSeq; LeaveCriticalSection(&g_toastCs);
+            g_tpAlpha = menu ? 0.60f : 0.88f; g_tpLine2 = menu ? t2 : nullptr;
+            Rel(g_nTex[4]); const bool okp = TextPicture(t, t, &g_nTex[4]); g_tpAlpha = 0.88f; g_tpLine2 = nullptr; if (!okp) return nullptr;
             g_toastBuilt = seq; g_nShown = -1;
         }
         v = 4 + (int)(g_toastBuilt & 0xffff) * 8;   // a new message forces a copy
@@ -932,9 +944,29 @@ static void OnPresentLocked(IDirect3DDevice9* dev) {
         static bool f5p; bool f5 = g_devKeys && (GetAsyncKeyState(VK_F5) & 0x8000) != 0;
         if (f5 && !f5p) { g_flatForce = (g_flatForce + 1) % 3; Log("xr: F5 -> %s", g_flatForce == 0 ? "automatic" : g_flatForce == 1 ? "forced flat screen" : "forced VR"); }
         f5p = f5;
-        static bool insp; bool ins = (GetAsyncKeyState(VK_INSERT) & 0x8000) != 0;   // build 075: DLSS on / off
-        if (ins && !insp) ddlss::Toggle();
-        insp = ins;
+        static bool homep; bool home = (GetAsyncKeyState(VK_HOME) & 0x8000) != 0;   // DLSS on / off (build 075 on Insert; Home since build 132)
+        if (home && !homep) ddlss::Toggle();
+        homep = home;
+        {   // build 132: in-game world scale menu. Insert opens / closes it; Left / Right change the size in steps of 0.05 (0.50 .. 2.00,
+            // the launcher's scale: WorldScale = 100 / size); it applies at once and is written to ddda_vr.ini when the menu closes.
+            static bool insp, open, lp, rp; static double rep; static float size0;
+            const bool ins = (GetAsyncKeyState(VK_INSERT) & 0x8000) != 0;
+            auto show = [&]() { wchar_t l1[64]; swprintf(l1, 64, L"World scale   %.2f", 100.0f / g_scale); ShowMenu(l1, L"Left / Right arrows: smaller / larger      Insert: close"); };
+            if (ins && !insp) { open = !open;
+                if (open) { size0 = 100.0f / g_scale; show(); Log("xr: world scale menu opened (%.2f)", size0); }
+                else { HideMenu(); const float sz = 100.0f / g_scale;
+                    if (fabsf(sz - size0) > 0.001f && g_iniPath[0]) { wchar_t v[32]; swprintf(v, 32, L"%.2f", g_scale); WritePrivateProfileStringW(L"VR", L"WorldScale", v, g_iniPath);
+                        wchar_t m[64]; swprintf(m, 64, L"World scale %.2f saved", sz); ShowMessage(m, 2.0); }
+                    Log("xr: world scale menu closed (%.2f, WorldScale %.2f)", sz, g_scale); } }
+            insp = ins;
+            if (open) {
+                const bool l = (GetAsyncKeyState(VK_LEFT) & 0x8000) != 0, r = (GetAsyncKeyState(VK_RIGHT) & 0x8000) != 0; int dir = 0;
+                if (l && !lp) { dir = -1; rep = now + 400; } else if (r && !rp) { dir = 1; rep = now + 400; }
+                else if ((l || r) && now >= rep) { dir = l ? -1 : 1; rep = now + 120; }   // held: repeats
+                lp = l; rp = r;
+                if (dir) { float sz = 100.0f / g_scale; sz = floorf(sz * 20.0f + 0.5f) / 20.0f + dir * 0.05f; if (sz < 0.5f) sz = 0.5f; if (sz > 2.0f) sz = 2.0f; g_scale = 100.0f / sz; show(); }
+            }
+        }
         static bool f2p; bool f2 = (GetAsyncKeyState(VK_F2) & 0x8000) != 0;   // build 108: first person on / off
         if (f2 && !f2p) { g_fp = !g_fp; Log("xr: F2 -> first person %s", g_fp ? "on" : "off"); ShowMessage(g_fp ? L"First person: ON (experimental)" : L"First person: OFF", 2.0); }
         f2p = f2;
@@ -1104,7 +1136,14 @@ static void OnPresentLocked(IDirect3DDevice9* dev) {
 
 void ShowMessage(const wchar_t* text, double seconds) {   // build 101
     if (!g_toastCsInit) { InitializeCriticalSection(&g_toastCs); g_toastCsInit = true; }
-    EnterCriticalSection(&g_toastCs); wcsncpy(g_toastText, text, 63); g_toastText[63] = 0; g_toastSeq++; g_toastUntil = Ms() + seconds * 1000.0; LeaveCriticalSection(&g_toastCs);
+    EnterCriticalSection(&g_toastCs); wcsncpy(g_toastText, text, 63); g_toastText[63] = 0; g_toastMenu = false; g_toastSeq++; g_toastUntil = Ms() + seconds * 1000.0; LeaveCriticalSection(&g_toastCs);
 }
+
+// build 132: the in-game menu panel (stays until HideMenu): a see-through panel with a value line and a help line
+void ShowMenu(const wchar_t* line1, const wchar_t* line2) {
+    if (!g_toastCsInit) { InitializeCriticalSection(&g_toastCs); g_toastCsInit = true; }
+    EnterCriticalSection(&g_toastCs); wcsncpy(g_toastText, line1, 63); g_toastText[63] = 0; wcsncpy(g_toastLine2, line2, 79); g_toastLine2[79] = 0; g_toastMenu = true; g_toastSeq++; g_toastUntil = Ms() + 3.6e6; LeaveCriticalSection(&g_toastCs);
+}
+void HideMenu() { if (!g_toastCsInit) return; EnterCriticalSection(&g_toastCs); if (g_toastMenu) g_toastUntil = 0; LeaveCriticalSection(&g_toastCs); }
 
 } // namespace dxr
