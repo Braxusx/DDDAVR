@@ -594,13 +594,16 @@ static void FpTurnRestore(float* tex, int rows, int ti) {
         r.n = 0; }
     g_turnDirtyT[ti] = false; g_fpTurnDirty = g_turnDirtyT[0] || g_turnDirtyT[1] || g_turnDirtyT[2] || g_turnDirtyT[3];
 }
-struct Snap { float tex[16][1024][4]; int rows; long seq; int nEq; int eq[16]; volatile bool ready; }; static Snap g_snap[3]; static Snap* volatile g_snapNew;
+struct Snap { float tex[16][1024][4]; int rows; long seq; int nEq; int eq[16]; volatile bool ready; }; static Snap g_snap[6]; static Snap* volatile g_snapNew;
 // build 124: whose equipment. A worn or carried piece is driven by one of the player's joints, so one of its first bones stays in a
 // fixed relation to one of the player's bones (inverse(player bone) x piece bone is constant) while the player moves; nothing of
 // another character can do that. A piece is the player's once that has held over 60 units of the player's own movement; it is
 // re-tested when the relation breaks (drawn, sheathed) and dropped after 150 units of movement without one, or 170 away.
 // (123 went by a steady distance, which simulated or swinging pieces fail - they stayed unturned beside the turned body.)
-struct Trk { int idx; bool owned, refOk; int nb; uint64_t alive[4]; float ref[4][48][12]; float path, bad; int away; long seq; };
+struct Trk { int idx; bool owned, refOk; int nb, frames; uint64_t alive[4]; float ref[4][48][12]; float path, bad; int away; long seq; };
+// relations seen on pieces that were the player's (piece bone, player bone, the constant): a piece showing one again is the player's
+// at once - a sheathed bow is back without the player having to walk first
+struct RelMem { int pb, b; float C[12]; }; static RelMem g_relMem[48]; static int g_relN, g_relNext;
 static Trk g_trk[20]; static float g_trkRoot[3], g_trkPsi; static float g_turnPath; static bool g_trkInit;
 static void FpTurnSkeletons(float* tex, int rows, int ti) {
     (void)ti;
@@ -639,14 +642,21 @@ static void FpTurnSkeletons(float* tex, int rows, int ti) {
                 for (int r = 0; r < 3; r++) { for (int c2 = 0; c2 < 3; c2++) C[r * 4 + c2] = I[r * 3] * Sp[c2] + I[r * 3 + 1] * Sp[4 + c2] + I[r * 3 + 2] * Sp[8 + c2];
                     C[r * 4 + 3] = I[r * 3] * (Sp[3] - Sb[3]) + I[r * 3 + 1] * (Sp[7] - Sb[7]) + I[r * 3 + 2] * (Sp[11] - Sb[11]); }
                 float* R = t->ref[pb][b];
+                if (!t->owned) for (int m2 = 0; m2 < g_relN; m2++) { const RelMem& rm = g_relMem[m2]; if (rm.pb != pb || rm.b != b) continue;
+                    bool eqv = true; for (int e2 = 0; e2 < 12 && eqv; e2++) eqv = fabsf(C[e2] - rm.C[e2]) < ((e2 & 3) == 3 ? 0.012f : 0.005f);
+                    if (eqv) { t->owned = true; t->bad = 0; Log("fp: equipment at bone texture %d,%d is the player's (a relation seen before)", idx % 1024, idx / 1024); break; } }
                 if (!t->refOk) { memcpy(R, C, 48); continue; }
                 bool same = true; for (int e2 = 0; e2 < 12 && same; e2++) same = fabsf(C[e2] - R[e2]) < ((e2 & 3) == 3 ? 0.012f : 0.005f);
                 if (!same) al &= ~(1ull << b);
             }
             t->alive[pb] = al; if (al) any = true;
         }
-        if (!t->refOk) { t->refOk = true; t->path = 0; }
-        else if (any) { t->path += step; if (t->path >= 60.0f) { if (!t->owned) Log("fp: equipment at bone texture %d,%d is the player's (rigid to a player bone over %.0f units)", idx % 1024, idx / 1024, t->path); t->owned = true; t->bad = 0; } }
+        if (!t->refOk) { t->refOk = true; t->path = 0; t->frames = 0; }
+        else if (any) { t->path += step < 12.0f ? step : 12.0f; t->frames++; if (t->path >= 60.0f && t->frames >= 20) {
+            if (t->bad == 0 || !t->owned) for (int pb = 0; pb < t->nb; pb++) { if (!t->alive[pb]) continue; int b = 0; while (!((t->alive[pb] >> b) & 1)) b++;   // remember this relation
+                bool known = false; for (int m2 = 0; m2 < g_relN && !known; m2++) known = g_relMem[m2].pb == pb && g_relMem[m2].b == b && fabsf(g_relMem[m2].C[3] - t->ref[pb][b][3]) < 0.012f && fabsf(g_relMem[m2].C[0] - t->ref[pb][b][0]) < 0.005f && fabsf(g_relMem[m2].C[5] - t->ref[pb][b][5]) < 0.005f && fabsf(g_relMem[m2].C[7] - t->ref[pb][b][7]) < 0.012f && fabsf(g_relMem[m2].C[11] - t->ref[pb][b][11]) < 0.012f;
+                if (!known) { RelMem& rm = g_relMem[g_relNext]; g_relNext = (g_relNext + 1) % 48; if (g_relN < 48) g_relN++; rm.pb = pb; rm.b = b; memcpy(rm.C, t->ref[pb][b], 48); }
+                break; } if (!t->owned) Log("fp: equipment at bone texture %d,%d is the player's (rigid to a player bone over %.0f units)", idx % 1024, idx / 1024, t->path); t->owned = true; t->bad = 0; } }
         else { t->bad += t->path + step; t->refOk = false; t->path = 0;   // relation broken: start again from this frame
             if (t->owned && t->bad > 150.0f) { t->owned = false; Log("fp: equipment at bone texture %d,%d no longer follows the player", idx % 1024, idx / 1024); } }
         if (t->idx && t->owned && nEq < 16) eq[nEq++] = { idx, now };
@@ -654,7 +664,7 @@ static void FpTurnSkeletons(float* tex, int rows, int ti) {
     for (int i = 0; i < 16; i++) g_eqSlot[i] = i < nEq ? eq[i] : EqSlot{ 0, 0 };
     // build 126: the game's texture is left alone. The frame's bones (first 16 rows) are copied to a snapshot, the player's and the
     // player's equipment's bones are turned in that copy, and the render thread draws the player from it (see FpBindPlayerTex).
-    static int which; Snap& sp = g_snap[which = (which + 1) % 3]; sp.ready = false;
+    static int which; Snap& sp = g_snap[which = (which + 1) % 6]; sp.ready = false;
     const int rws = rows < 16 ? rows : 16; memcpy(sp.tex, tex, (size_t)rws * 16384); sp.rows = rws; sp.seq = now; sp.nEq = nEq; for (int i = 0; i < nEq; i++) sp.eq[i] = eq[i].idx;
     float* st = (float*)sp.tex;
     float lx, lz;
@@ -798,11 +808,21 @@ static float g_fpPlB[2][4];
 extern IDirect3DTexture9* g_fpA2X; extern volatile long g_fpA2SeqX;
 static HRESULT FpTexLockRaw(IDirect3DTexture9* t, D3DLOCKED_RECT* lr, DWORD fl); static HRESULT FpTexUnlockRaw(IDirect3DTexture9* t);
 static IDirect3DBaseTexture9* g_fpPrevTex; static DWORD g_fpPrevSamp; static volatile long g_dgBound, g_dgSnapMatch, g_dgSnapOther;
-// build 126: the snapshot that belongs to the camera frame being drawn (else the newest)
+// build 127: the snapshot that belongs to the camera being drawn. Frame numbers did not line up (126 never found a match and fell
+// back to the newest, so the body ran a varying one or two frames ahead of the camera - the stutter). Now: the snapshot whose
+// head is nearest to the eye point that camera was built with.
+static volatile long g_dgAge[6], g_dgDeclYes, g_dgDeclNo; static volatile bool g_declCheck = true;
 static const Snap* FpSnapNow() {
-    const long want = dxr::ReplayFpSeq(); const Snap* best = nullptr;
-    for (int i = 0; i < 3; i++) { const Snap* q = &g_snap[i]; if (!q->ready) continue; if (q->seq == want) return q; if (!best || q->seq > best->seq) best = q; }
-    if (best && g_camSeq - best->seq > 6) return nullptr;   // stale (first person was off): let the game draw as it is
+    static const Snap* last; static long lastKey = -2; static int lastRep = -2;
+    const long key = dxr::ReplayFpSeq(); if (key == lastKey && g_replay == lastRep && last && last->ready) return last;
+    float e[3]; const bool haveEye = dxr::ReplayFpEye(e) && g_fpQok; const Snap* best = nullptr; float bd = 1e30f; const long now = g_camSeq;
+    for (int i = 0; i < 6; i++) { const Snap* q = &g_snap[i]; if (!q->ready || now - q->seq > 8) continue;
+        float dq;
+        if (haveEye) { float J[3], U[3], F[3]; if (!FpHeadFrame((const float*)q->tex + 15 * 12, J, U, F)) continue;
+            const float dx = J[0] + U[0] * kFpEyeUp + F[0] * kFpEyeFwd - e[0], dy = J[1] + U[1] * kFpEyeUp + F[1] * kFpEyeFwd - e[1], dz = J[2] + U[2] * kFpEyeUp + F[2] * kFpEyeFwd - e[2]; dq = dx * dx + dy * dy + dz * dz; }
+        else dq = (float)(now - q->seq);
+        if (dq < bd) { bd = dq; best = q; } }
+    if (best && key >= 0) { last = best; lastKey = key; lastRep = g_replay; long a = now - best->seq; if (a < 0) a = 0; if (a > 5) a = 5; if (g_replay == 0) InterlockedIncrement(&g_dgAge[a]); }
     return best;
 }
 // build 126: the player's (and the player's equipment's) draws read their bones from the mod's own texture, filled from that
@@ -834,6 +854,20 @@ static int FpClipPre(IDirect3DDevice9* d) {
     if (tx < 0 || tx > 1021 || ty < 0 || ty > 15) return 0;
     const int idx = ty * 1024 + tx; g_slotSeen[idx] = (uint16_t)g_camSeq;
     const Snap* S = FpSnapNow(); if (!S) return 0;
+    {   // build 127: a draw without bone indices in its vertex format is not a skinned mesh, whatever its shader's constants hold (grass
+        // and the like were being taken for the player through a leftover constant, cut at the neck plane and given the player's bones)
+        struct DeclC { IDirect3DVertexDeclaration9* d; bool skinned; }; static DeclC dc[64]; static int dn;
+        IDirect3DVertexDeclaration9* vd = nullptr; bool skinned = true;
+        if (SUCCEEDED(d->GetVertexDeclaration(&vd)) && vd) {
+            int f = -1; for (int i = 0; i < dn; i++) if (dc[i].d == vd) { f = i; break; }
+            if (f < 0) { D3DVERTEXELEMENT9 el[MAXD3DDECLLENGTH + 1]; UINT ne = 0; bool sk2 = false;
+                if (SUCCEEDED(vd->GetDeclaration(el, &ne))) for (UINT i = 0; i < ne; i++) if (el[i].Usage == D3DDECLUSAGE_BLENDINDICES || el[i].Usage == D3DDECLUSAGE_BLENDWEIGHT) sk2 = true;
+                f = dn < 64 ? dn++ : 63; dc[f] = { vd, sk2 }; }
+            skinned = dc[f].skinned; vd->Release();
+        }
+        if (idx == 0) { if (skinned) InterlockedIncrement(&g_dgDeclYes); else InterlockedIncrement(&g_dgDeclNo); }
+        if (!skinned && g_declCheck) return 0;
+    }
     const bool player = idx == 0; bool mine = player; for (int i = 0; i < S->nEq && !mine; i++) mine = S->eq[i] == idx;
     if (!mine) return 0;
     int rc = FpBindPlayerTex(d, v->samp, S) ? 4 : 0;
@@ -2097,8 +2131,11 @@ static void FpFindTarget(void* cam, const float* V, const float* P) {
                 }
                 g_fpHideOn = ok && dxr::FirstPerson(); g_fpWantBones = g_fpHideOn; g_fpRootOk = ok; InterlockedIncrement(&g_camSeq); dxr::SetFpSeq(g_camSeq);
                 { static DWORD lastD; if (g_fpHideOn && nowT - lastD > 10000) { lastD = nowT;
-                    Log("fp: diag - %ld bone-texture unlocks, %ld player/equipment draws from the mod's bone texture, texture refilled %ld times from the matching camera frame and %ld times from another",
-                        InterlockedExchange(&g_dgUnlock, 0), InterlockedExchange(&g_dgBound, 0), InterlockedExchange(&g_dgSnapMatch, 0), InterlockedExchange(&g_dgSnapOther, 0)); g_dgOrderN = 0; } }
+                    {   const long dy = InterlockedExchange(&g_dgDeclYes, 0), dn2 = InterlockedExchange(&g_dgDeclNo, 0);
+                        if (g_declCheck && dy == 0 && dn2 > 2000) { g_declCheck = false; Log("fp: the player's meshes carry no bone-index vertex element - that test is switched off"); }
+                        Log("fp: diag - draws claiming the player's skeleton: %ld with bone indices in the vertex format, %ld without (%s)", dy, dn2, g_declCheck ? "left to the game" : "accepted"); }
+                    Log("fp: diag - %ld bone-texture unlocks, %ld player/equipment draws from the mod's bone texture; snapshot chosen was 0:%ld 1:%ld 2:%ld 3:%ld 4:%ld 5+:%ld camera frames old",
+                        InterlockedExchange(&g_dgUnlock, 0), InterlockedExchange(&g_dgBound, 0), InterlockedExchange(&g_dgAge[0], 0), InterlockedExchange(&g_dgAge[1], 0), InterlockedExchange(&g_dgAge[2], 0), InterlockedExchange(&g_dgAge[3], 0), InterlockedExchange(&g_dgAge[4], 0), InterlockedExchange(&g_dgAge[5], 0)); g_dgOrderN = 0; } }
                 { static DWORD lastC; if (g_fpHideOn && nowT - lastC > 10000) { lastC = nowT; Log("fp: own-body cut used on %ld draws, carried-equipment cut on %ld draws in the last 10 s", InterlockedExchange(&g_fpClipped, 0), InterlockedExchange(&g_fpClippedEq, 0)); } }
                 if ((int)ok != state) { state = ok; Log("fp: %s (camera class %p, distance %.0f)", ok ? "character found under the camera target - first person available" : "no character under the camera target - first person paused", *(void* const*)o, dist); }
             }
