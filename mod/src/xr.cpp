@@ -543,7 +543,10 @@ bool WorldGuiToEye(int mode, float x, float y, float z, float* X, float* Y, floa
     float Mi[16]; if (!MatInv(c.Mh, Mi)) return false;   // head view -> game view
     const float a = r[0] * Mi[2] + r[1] * Mi[6] + r[2] * Mi[10], b = Mi[14];   // game view z = t*a + b
     float t = fabsf(a) > 1e-4f ? (s * z - b) / a : z;
-    if (t < 1.0f) t = z;
+    // build 133: in first person the game's anchor can lie behind the eye (a pawn beside you: his bar is placed 65 units towards
+    // the third-person camera, which is behind you). The game still projects it, mirrored through the eye, and the depth equation
+    // then gives a negative t - which is the true place. Keep it; 115-132 replaced it by the raw depth and the bar wandered.
+    if (t < 1.0f && !(c.fp && fabsf(a) > 1e-4f && t < -1.0f)) t = z;
     float pe[4] = { r[0] * t, r[1] * t, r[2] * t, 1.0f };
     if (mode & 0x200) {   // build 122: the aiming reticle in first person - a point far along the game camera's own axis (where
         // the game shoots), seen from the first-person eye; the level first-person view does not carry the camera's pitch

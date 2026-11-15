@@ -686,6 +686,11 @@ static void FpTurnSkeletons(float* tex, int rows, int ti) {
         const float fx = st[2], fz = st[10], fl = sqrtf(fx * fx + fz * fz);   // player bone 0, packed +z = forward
         if (fl > 20) {
             float dd = atan2f(lx, lz) - atan2f(fx, fz); while (dd > 3.14159265f) dd -= 6.2831853f; while (dd < -3.14159265f) dd += 6.2831853f;
+            // build 133: not while aiming (game view zoomed). The game aims with its own camera; a body turned to the head showed the
+            // bow pointing where you look while the arrow and the reticle go where the game aims. The change is eased in and out.
+            {   static float ddS; if (dxr::GameViewZoomed()) dd = 0;
+                float st2 = dd - ddS; while (st2 > 3.14159265f) st2 -= 6.2831853f; while (st2 < -3.14159265f) st2 += 6.2831853f;
+                if (st2 > 0.15f) st2 = 0.15f; if (st2 < -0.15f) st2 = -0.15f; ddS += st2; while (ddS > 3.14159265f) ddS -= 6.2831853f; while (ddS < -3.14159265f) ddS += 6.2831853f; dd = ddS; }
             // build 131: turned about the vertical through the head joint, taken from this skeleton (was: the character position the
             // camera reports, which is not always the player's) - the head, and so the eye, stays where it is while the body turns under it
             float cx = g_fpRoot[0], cz = g_fpRoot[2]; { float J[3], U[3], F[3]; if (FpHeadFrame(st + 15 * 12, J, U, F)) { cx = J[0]; cz = J[2]; } }
