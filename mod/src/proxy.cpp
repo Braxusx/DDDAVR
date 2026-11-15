@@ -601,11 +601,12 @@ static IDirect3DTexture9* g_btCur; static Snap g_snap[6]; static Snap* volatile 
 // another character can do that. A piece is the player's once that has held over 60 units of the player's own movement; it is
 // re-tested when the relation breaks (drawn, sheathed) and dropped after 150 units of movement without one, or 170 away.
 // (123 went by a steady distance, which simulated or swinging pieces fail - they stayed unturned beside the turned body.)
-struct Trk { int idx; bool owned, refOk; int nb, frames; uint64_t alive[4]; float ref[4][48][12]; float path, bad, refRoot[3], refPsi; int away; long seq; };
+struct Trk { int idx; bool owned, refOk; int nb, frames; uint64_t alive[4]; float ref[4][48][12]; float path, bad, refRoot[3], refPsi, refT[48][3]; int away; long seq; };
 // relations seen on pieces that were the player's (piece bone, player bone, the constant): a piece showing one again is the player's
 // at once - a sheathed bow is back without the player having to walk first
 struct RelMem { int pb, b; float C[12]; }; static RelMem g_relMem[48]; static int g_relN, g_relNext;
 static Trk g_trk[20]; static float g_trkRoot[3], g_trkPsi; static float g_turnPath; static bool g_trkInit;
+static bool FpHeadFrame(const float* S, float* J, float* U, float* F);
 static void FpTurnSkeletons(float* tex, int rows, int ti) {
     (void)ti;
     const long now = g_camSeq; const int lim = rows * 1024;
@@ -622,7 +623,7 @@ static void FpTurnSkeletons(float* tex, int rows, int ti) {
         I[0] = (m11 * m22 - m12 * m21) * id; I[1] = (m02 * m21 - m01 * m22) * id; I[2] = (m01 * m12 - m02 * m11) * id;
         I[3] = (m12 * m20 - m10 * m22) * id; I[4] = (m00 * m22 - m02 * m20) * id; I[5] = (m02 * m10 - m00 * m12) * id;
         I[6] = (m10 * m21 - m11 * m20) * id; I[7] = (m01 * m20 - m00 * m21) * id; I[8] = (m00 * m11 - m01 * m10) * id; }
-    for (int i = 0; i < 20; i++) if (g_trk[i].idx && now - g_trk[i].seq > 30) g_trk[i].idx = 0;   // not drawn for half a second: forget
+    for (int i = 0; i < 20; i++) if (g_trk[i].idx && now - g_trk[i].seq > 30) { if (g_trk[i].owned) Log("fp: equipment at bone texture %d,%d dropped (not drawn for 30 frames)", g_trk[i].idx % 1024, g_trk[i].idx / 1024); g_trk[i].idx = 0; }   // forget
     int nEq = 0; EqSlot eq[16];
     for (int idx = 3; idx + 3 <= lim; idx += 3) {
         if ((uint16_t)((uint16_t)now - g_slotSeen[idx]) >= 4) continue;
@@ -638,7 +639,7 @@ static void FpTurnSkeletons(float* tex, int rows, int ti) {
             // other models' - one of the player's one-joint pieces sitting right after the pawn's staff made the staff "the player's".
             int nb = 1; t->nb = nb; }
         t->seq = now;
-        if (len >= 170.0f) { if (++t->away > 20) { t->idx = 0; continue; } } else t->away = 0;
+        if (len >= 170.0f) { if (++t->away > 20) { if (t->owned) Log("fp: equipment at bone texture %d,%d dropped (%.0f away, %.0f up)", idx % 1024, idx / 1024, hd, dy); t->idx = 0; continue; } } else t->away = 0;
         bool any = false;
         for (int pb = 0; pb < t->nb; pb++) {
             const float* Sp = tex + (idx + pb * 3) * 4; uint64_t al = t->refOk ? t->alive[pb] : ~0ull;
@@ -657,17 +658,19 @@ static void FpTurnSkeletons(float* tex, int rows, int ti) {
             }
             t->alive[pb] = al; if (al) any = true;
         }
-        if (!t->refOk) { t->refOk = true; t->path = 0; t->frames = 0; memcpy(t->refRoot, g_fpRoot, 12); t->refPsi = psi; }
+        if (!t->refOk) { t->refOk = true; t->path = 0; t->frames = 0; for (int b = 0; b < 48; b++) { const float* Sb = tex + b * 12; t->refT[b][0] = Sb[3]; t->refT[b][1] = Sb[7]; t->refT[b][2] = Sb[11]; } }
         else if (any) {
-            // build 129: evidence = how far the player has actually got from where the comparison started (position, or heading), not
-            // movement added up - idle sway added up to "60 units" in a quarter of a minute and made a standing pawn's staff "the player's"
-            float dpsi = psi - t->refPsi; while (dpsi > 3.14159265f) dpsi -= 6.2831853f; while (dpsi < -3.14159265f) dpsi += 6.2831853f;
-            const float ax = g_fpRoot[0] - t->refRoot[0], ay = g_fpRoot[1] - t->refRoot[1], az = g_fpRoot[2] - t->refRoot[2];
-            t->path = sqrtf(ax * ax + ay * ay + az * az) + 60.0f * fabsf(dpsi); t->frames++; if (t->path >= 60.0f && t->frames >= 20) {
+            // build 131: evidence = how far the player BONE the piece is tied to has moved since the comparison started, taken from the
+            // skeleton itself. (129/130 used the character position the camera reports; that value jumps - one acceptance was "over
+            // 393 units" in a single frame - and each jump made whatever stood near, the pawn's staff included, count as proven.)
+            // It also proves a bow in the hand while the player stands and only the arm moves.
+            float best = 0; { const uint64_t al = t->alive[0]; for (int b = 0; b < 48; b++) if ((al >> b) & 1) { const float* Sb = tex + b * 12;
+                const float ax = Sb[3] - t->refT[b][0], ay = Sb[7] - t->refT[b][1], az = Sb[11] - t->refT[b][2]; const float dd = sqrtf(ax * ax + ay * ay + az * az); if (dd > best) { best = dd; t->refPsi = (float)b; } } }
+            t->path = best; t->frames++; if (t->path >= 60.0f && t->frames >= 20) {
             if (t->bad == 0 || !t->owned) for (int pb = 0; pb < t->nb; pb++) { if (!t->alive[pb]) continue; int b = 0; while (!((t->alive[pb] >> b) & 1)) b++;   // remember this relation
                 bool known = false; for (int m2 = 0; m2 < g_relN && !known; m2++) known = g_relMem[m2].pb == pb && g_relMem[m2].b == b && fabsf(g_relMem[m2].C[3] - t->ref[pb][b][3]) < 0.012f && fabsf(g_relMem[m2].C[0] - t->ref[pb][b][0]) < 0.005f && fabsf(g_relMem[m2].C[5] - t->ref[pb][b][5]) < 0.005f && fabsf(g_relMem[m2].C[7] - t->ref[pb][b][7]) < 0.012f && fabsf(g_relMem[m2].C[11] - t->ref[pb][b][11]) < 0.012f;
                 if (!known) { RelMem& rm = g_relMem[g_relNext]; g_relNext = (g_relNext + 1) % 48; if (g_relN < 48) g_relN++; rm.pb = pb; rm.b = b; memcpy(rm.C, t->ref[pb][b], 48); }
-                break; } if (!t->owned) Log("fp: equipment at bone texture %d,%d is the player's (rigid to a player bone over %.0f units)", idx % 1024, idx / 1024, t->path); t->owned = true; t->bad = 0; } }
+                break; } if (!t->owned) Log("fp: equipment at bone texture %d,%d is the player's (rigid to player bone %d, which moved %.0f units; scale %.0f, %.0f away, %.0f up)", idx % 1024, idx / 1024, (int)t->refPsi, t->path, sc, hd, dy); t->owned = true; t->bad = 0; } }
         else { t->bad += step < 12.0f ? step : 12.0f; t->refOk = false; t->path = 0;   // relation broken: start again from this frame
             if (t->owned && t->bad > 150.0f) { t->owned = false; Log("fp: equipment at bone texture %d,%d no longer follows the player", idx % 1024, idx / 1024); } }
         if (t->idx && t->owned && nEq < 16) eq[nEq++] = { idx, now };
@@ -683,7 +686,10 @@ static void FpTurnSkeletons(float* tex, int rows, int ti) {
         const float fx = st[2], fz = st[10], fl = sqrtf(fx * fx + fz * fz);   // player bone 0, packed +z = forward
         if (fl > 20) {
             float dd = atan2f(lx, lz) - atan2f(fx, fz); while (dd > 3.14159265f) dd -= 6.2831853f; while (dd < -3.14159265f) dd += 6.2831853f;
-            const float c = cosf(dd), sn = sinf(dd), cx = g_fpRoot[0], cz = g_fpRoot[2]; const int lim2 = rws * 1024;
+            // build 131: turned about the vertical through the head joint, taken from this skeleton (was: the character position the
+            // camera reports, which is not always the player's) - the head, and so the eye, stays where it is while the body turns under it
+            float cx = g_fpRoot[0], cz = g_fpRoot[2]; { float J[3], U[3], F[3]; if (FpHeadFrame(st + 15 * 12, J, U, F)) { cx = J[0]; cz = J[2]; } }
+            const float c = cosf(dd), sn = sinf(dd); const int lim2 = rws * 1024;
             for (int k = 0; k < 17; k++) {
                 int idx, cap;
                 if (k == 0) { idx = 0; cap = 96; }
@@ -1107,10 +1113,10 @@ static void ShaderScan(void* ptr, const DWORD* fn, size_t nt, const char* kind) 
 static void ShaderScanVS(IDirect3DVertexShader9* p) { if (!p) return; UINT sz = 0; if (FAILED(p->GetFunction(nullptr, &sz)) || sz < 32 || sz > 262144) return; std::vector<DWORD> fn(sz / 4 + 1); if (SUCCEEDED(p->GetFunction(fn.data(), &sz))) ShaderScan(p, fn.data(), sz / 4, "vs"); }
 static void ShaderScanPS(IDirect3DPixelShader9* p) { if (!p) return; UINT sz = 0; if (FAILED(p->GetFunction(nullptr, &sz)) || sz < 32 || sz > 262144) return; std::vector<DWORD> fn(sz / 4 + 1); if (SUCCEEDED(p->GetFunction(fn.data(), &sz))) ShaderScan(p, fn.data(), sz / 4, "ps"); }
 extern volatile bool g_fpHideOnX;
-static HRESULT STDMETHODCALLTYPE hkSetPS(IDirect3DDevice9* d, IDirect3DPixelShader9* p) { HPScope _hp(HP_SetPS); g_curPS = p; if (g_fpHideOnX) ShaderScanPS(p);
+static HRESULT STDMETHODCALLTYPE hkSetPS(IDirect3DDevice9* d, IDirect3DPixelShader9* p) { HPScope _hp(HP_SetPS); g_curPS = p;
     g_curPSF = p ? ((g_grN && IsGodRaysPS(p)) ? PSF_GODRAYS : 0) | ((g_dofN && IsDofPS(p)) ? PSF_DOF : 0) | ((g_ipN && IsImagePlanePS(p)) ? PSF_IMAGEPLANE : 0) : 0;
     return oSetPS(d, p); }
-static HRESULT STDMETHODCALLTYPE hkSetVS(IDirect3DDevice9* d, IDirect3DVertexShader9* p) { HPScope _hp(HP_SetVS); g_curVS = p; if (g_fpHideOnX) ShaderScanVS(p);
+static HRESULT STDMETHODCALLTYPE hkSetVS(IDirect3DDevice9* d, IDirect3DVertexShader9* p) { HPScope _hp(HP_SetVS); g_curVS = p;
     extern bool IsGuiVS(void* p);
     g_curVSF = p ? (IsGuiVS(p) ? VSF_GUI : 0) | ((g_primN && IsPrimVS(p)) ? VSF_PRIM : 0) | ((g_primN && IsPrimShiftVS(p)) ? VSF_PRIMSHIFT : 0) | ((g_flareN && IsFlareVS(p)) ? VSF_FLARE : 0) : 0;
     return oSetVS(d, p); }
