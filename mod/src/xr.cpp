@@ -297,7 +297,7 @@ void ShowMenu(const wchar_t* line1, const wchar_t* line2); void HideMenu();
 static bool g_frameOpen; static XrFrameState g_fs{ XR_TYPE_FRAME_STATE };
 static Q g_refYaw{ 0, 0, 0, 1 }; static float g_refPos[3]; static bool g_refSet, g_wantRef;
 static long g_camCalls, g_camApplied;
-static WORD g_fpPadMask = 0x2200; static WORD PadMask(const wchar_t* t);   // build 134: RB + B
+static WORD g_fpPadMask = 0x0280; static float g_fpPadHold = 0.6f; static WORD PadMask(const wchar_t* t);   // build 135: RB + right stick click, held
 static int g_fp, g_autoRecenter = 1; static float g_fpUp, g_fpFwd = 0.0f, g_fpHide = 0.22f, g_fpBarPush = 65.0f, g_fpBarLift = 12.0f, g_fpRetDist = 3000.0f, g_fpEye[3]; static volatile bool g_fpEyeValid, g_fpActive, g_fpLookOk; static float g_fpLook[2]; static volatile long g_fpSeq = -1;   // build 108
 
 void ConfigureTracking(const wchar_t* ini) {
@@ -318,7 +318,8 @@ void ConfigureTracking(const wchar_t* ini) {
       GetPrivateProfileStringW(L"VR", L"FpBarPush", L"65", u, 32, ini); g_fpBarPush = (float)_wtof(u);
       GetPrivateProfileStringW(L"VR", L"FpBarLift", L"12", u, 32, ini); g_fpBarLift = (float)_wtof(u);
       GetPrivateProfileStringW(L"VR", L"FpReticleDist", L"3000", u, 32, ini); g_fpRetDist = (float)_wtof(u); if (g_fpRetDist < 100) g_fpRetDist = 100;
-      GetPrivateProfileStringW(L"VR", L"FpPadButtons", L"RB+B", u, 32, ini); g_fpPadMask = PadMask(u); }
+      GetPrivateProfileStringW(L"VR", L"FpPadButtons", L"RB+RS", u, 32, ini); g_fpPadMask = PadMask(u);
+      GetPrivateProfileStringW(L"VR", L"FpPadHold", L"0.6", u, 32, ini); g_fpPadHold = (float)_wtof(u); if (g_fpPadHold < 0) g_fpPadHold = 0; if (g_fpPadHold > 5) g_fpPadHold = 5; }
     g_autoRecenter = GetPrivateProfileIntW(L"VR", L"AutoRecenter", 1, ini);
     Log("xr: FirstPerson=%d (F2 switches; eye %.2f m up, %.2f m forward of the character's head position; own body hidden within %.2f m) AutoRecenter=%d", g_fp, g_fpUp, g_fpFwd, g_fpHide, g_autoRecenter);
 }
@@ -996,18 +997,21 @@ static void OnPresentLocked(IDirect3DDevice9* dev) {
         }
         static bool f2p; bool f2 = (GetAsyncKeyState(VK_F2) & 0x8000) != 0;   // build 108: first person on / off
         bool pad = false;
-        if (g_fpPadMask) {   // build 134: the same switch on the gamepad (FpPadButtons, default RB+B), all buttons of the combination held
+        if (g_fpPadMask) {   // build 134: the same switch on the gamepad (FpPadButtons, default RB + right stick click), all buttons of the combination held
             typedef DWORD(WINAPI* XGS)(DWORD, void*); static XGS xgs; static bool tried; static int idx = 0; static double scanAt;
             if (!tried) { tried = true; HMODULE h = GetModuleHandleW(L"xinput1_3.dll"); if (!h) h = LoadLibraryW(L"xinput1_3.dll"); if (!h) h = LoadLibraryW(L"xinput9_1_0.dll");
-                if (h) xgs = (XGS)GetProcAddress(h, "XInputGetState"); Log("xr: gamepad switch for first person: buttons 0x%04x, XInput %s", g_fpPadMask, xgs ? "found" : "NOT found"); }
+                if (h) xgs = (XGS)GetProcAddress(h, "XInputGetState"); Log("xr: gamepad switch for first person: buttons 0x%04x held %.1f s, XInput %s", g_fpPadMask, g_fpPadHold, xgs ? "found" : "NOT found"); }
             if (xgs) { struct { DWORD pkt; WORD btn; BYTE lt, rt; SHORT lx, ly, rx, ry; } st;
                 if (idx >= 0 && xgs((DWORD)idx, &st) == 0) pad = (st.btn & g_fpPadMask) == g_fpPadMask;
                 else if (now >= scanAt) { scanAt = now + 2000; idx = -1; for (DWORD i = 0; i < 4; i++) if (xgs(i, &st) == 0) { idx = (int)i; break; } }   // an absent pad is slow to ask: look again every 2 s only
             }
         }
-        static bool padp;
-        if ((f2 && !f2p) || (pad && !padp)) { g_fp = !g_fp; Log("xr: %s -> first person %s", pad && !padp ? "gamepad" : "F2", g_fp ? "on" : "off"); ShowMessage(g_fp ? L"First person: ON" : L"First person: OFF", 2.0); }
-        f2p = f2; padp = pad;
+        // build 135: a long press (FpPadHold seconds, default 0.6) - the right stick click alone is the game's own camera reset
+        static double padSince; static bool padFired; bool padGo = false;
+        if (pad) { if (!padSince) padSince = now; if (!padFired && now - padSince >= g_fpPadHold * 1000.0) { padFired = true; padGo = true; } }
+        else { padSince = 0; padFired = false; }
+        if ((f2 && !f2p) || padGo) { g_fp = !g_fp; Log("xr: %s -> first person %s", padGo ? "gamepad" : "F2", g_fp ? "on" : "off"); ShowMessage(g_fp ? L"First person: ON" : L"First person: OFF", 2.0); }
+        f2p = f2;
         if (!runSince) runSince = now;
         // build 108: automatic recentre (AutoRecenter=1): 1, 3 and 6 s after the session starts, and 0.5 s after the game's
         // 3D camera first takes over from the flat screen - so the logos, the menu and the first view are in front of you
